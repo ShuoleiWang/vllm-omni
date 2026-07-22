@@ -12,6 +12,20 @@
   a plain `vllm serve` backend
 - Maintainer: Community
 
+## Native multi-stage speech output (experimental)
+
+The bundled Omni profile runs JoyAI and Qwen3-TTS as one pipeline: JoyAI first
+returns the complete action, then the TTS Talker streams codec chunks to
+Code2Wav:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction.yaml
+```
+
+It returns action text and conditional speech. ASR, session memory, the WebUI,
+and delegated-agent execution remain in the Day 0 serving layer below.
+
 ## When to use this recipe
 
 Use this to stand up the streaming-interaction serving layer (`vllm_omni/experimental/fullduplex/`).
@@ -197,9 +211,8 @@ the audio-track caveat.
 
 ## Notes
 
-- `--omni` is **not** used: the model keeps the Qwen3-VL architecture (only the
-  weights are retrained), so stock `vllm serve` runs the forward pass; this recipe
-  only adds the interaction/serving layer.
+- The Day 0 orchestrator path does **not** use `--omni`; the experimental native
+  multi-stage profile above does.
 - On a host without `nvcc` / `ninja`, `vllm serve` of the 8B can crash engine-core in the
   FlashInfer sampler JIT (`FileNotFoundError: 'ninja'`) during `profile_run`. Set
   `VLLM_USE_FLASHINFER_SAMPLER=0` (or install `ninja`) to work around it.

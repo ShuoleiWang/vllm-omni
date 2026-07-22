@@ -217,6 +217,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
+        edge_async_chunk: tuple[bool, ...] | list[bool] | None = None,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
@@ -228,8 +229,18 @@ class Orchestrator:
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
 
-        self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
+        if edge_async_chunk is None:
+            self.edge_async_chunk = tuple(bool(async_chunk) for _ in range(max(0, self.num_stages - 1)))
+        else:
+            self.edge_async_chunk = tuple(bool(value) for value in edge_async_chunk)
+            expected_edges = max(0, self.num_stages - 1)
+            if len(self.edge_async_chunk) != expected_edges:
+                raise ValueError(
+                    "edge_async_chunk must contain one value per adjacent stage "
+                    f"edge; got {len(self.edge_async_chunk)}, expected {expected_edges}"
+                )
+        self.async_chunk = any(self.edge_async_chunk)
         self.stage_pools: list[StagePool] = stage_pools
         self._orch_monitor = create_orch_monitor(
             enabled=enable_orch_monitor,
@@ -483,8 +494,13 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+        if self._is_async_edge(stage_id) and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(
+                request_id,
+                prompt,
+                req_state,
+                source_stage_id=stage_id,
+            )
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -526,8 +542,13 @@ class Orchestrator:
             prompt_text=msg.output_prompt_text,
         )
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, request, req_state)
+        if self._is_async_edge(stage_id) and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(
+                request_id,
+                request,
+                req_state,
+                source_stage_id=stage_id,
+            )
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -931,7 +952,7 @@ class Orchestrator:
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
-            and not self.async_chunk
+            and not self._is_async_edge(stage_id)
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
             if (
@@ -967,6 +988,12 @@ class Orchestrator:
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
+
+    def _is_async_edge(self, source_stage_id: int) -> bool:
+        edge_modes = getattr(self, "edge_async_chunk", None)
+        if edge_modes is None:
+            return bool(getattr(self, "async_chunk", False))
+        return 0 <= source_stage_id < len(edge_modes) and edge_modes[source_stage_id]
 
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
@@ -1070,7 +1097,7 @@ class Orchestrator:
         raw_outputs: EngineCoreOutputs,
     ) -> None:
         """Forward split requests once stage-0 KV is ready."""
-        if self.async_chunk:
+        if self._is_async_edge(stage_id):
             return
 
         for raw_output in raw_outputs.outputs:
@@ -1430,7 +1457,13 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
             return
 
+        if self._is_async_edge(next_logical) and len(next_inputs) != 1:
+            raise ValueError(
+                f"A sync-to-async bridge must produce exactly one downstream request, got {len(next_inputs)}"
+            )
+
         # Build and submit requests for each input
+        downstream_source_request: object | None = None
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
@@ -1444,6 +1477,7 @@ class Orchestrator:
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
             )
+            downstream_source_request = request
 
             if already_submitted:
                 await next_pool.submit_update(req_id, req_state, request)
@@ -1461,25 +1495,43 @@ class Orchestrator:
             tx_ms=_tx_ms,
         )
 
+        # A sync edge can feed a stage whose *outgoing* edge streams. Submit
+        # only that downstream async chain now, after the complete upstream
+        # output has been parsed into the real middle-stage request.
+        if downstream_source_request is not None and self._is_async_edge(next_logical):
+            await self._prewarm_async_chunk_stages(
+                req_id,
+                downstream_source_request,
+                req_state,
+                source_stage_id=next_logical,
+            )
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
-        stage0_request: Any,
+        source_request: object,
         req_state: OrchestratorRequestState,
+        *,
+        source_stage_id: int = 0,
     ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
-        if req_state.final_stage_id <= 0:
+        """Pre-submit the contiguous async edge chain after a source stage."""
+        if source_stage_id >= req_state.final_stage_id:
             return
 
-        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
+        prompt_token_ids = getattr(source_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
             logger.warning(
-                "[Orchestrator] async_chunk prewarm skipped for req=%s: stage0 prompt_token_ids missing",
+                "[Orchestrator] async_chunk prewarm skipped for req=%s: source stage-%s prompt_token_ids missing",
                 request_id,
+                source_stage_id,
             )
             return
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for next_stage_id in range(source_stage_id + 1, req_state.final_stage_id + 1):
+            if not self._is_async_edge(next_stage_id - 1):
+                break
+            if next_stage_id in req_state.stage_submit_ts:
+                continue
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
@@ -1517,7 +1569,7 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = bool(getattr(source_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -1533,9 +1585,8 @@ class Orchestrator:
                     prompt_text=None,
                 )
 
-            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is stage 0's bound replica (single-replica thinker in
-            # all current configs); fall back to 0 if unknown.
+            # async_chunk pre-submit fires per stage edge (N-1 -> N). Use the
+            # source stage's bound replica, falling back to 0 if unknown.
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
             self._emit_tx_edge(

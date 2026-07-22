@@ -63,6 +63,22 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
 )
 
 
+def uses_async_chunk_input(model_config: object) -> bool:
+    """Whether this stage receives incremental chunks from its upstream edge."""
+    directional = getattr(model_config, "async_chunk_input", None)
+    if directional is not None:
+        return bool(directional)
+    return bool(getattr(model_config, "async_chunk", False))
+
+
+def uses_async_chunk_output(model_config: object) -> bool:
+    """Whether this stage sends incremental chunks to its downstream edge."""
+    directional = getattr(model_config, "async_chunk_output", None)
+    if directional is not None:
+        return bool(directional)
+    return bool(getattr(model_config, "async_chunk", False))
+
+
 def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     """Returns True iff this stage parks pending requests in
     WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
@@ -73,7 +89,7 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     """
     if getattr(model_config, "stage_id", 0) <= 0:
         return False
-    if getattr(model_config, "async_chunk", False):
+    if uses_async_chunk_input(model_config):
         return False
     key = (
         getattr(model_config, "model_arch", None),

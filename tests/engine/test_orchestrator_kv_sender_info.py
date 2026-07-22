@@ -243,6 +243,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2
+    orchestrator.async_chunk = True
 
     req_state = OrchestratorRequestState(
         request_id="req-2",

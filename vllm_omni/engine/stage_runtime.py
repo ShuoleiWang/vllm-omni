@@ -350,10 +350,14 @@ class StageRuntime:
                     "orchestrator indexes stage pools by stage_id."
                 )
 
+            stage_engine_args = getattr(stage_cfg, "engine_args", None)
+            stage_async_chunk = bool(getattr(stage_engine_args, "async_chunk", self._async_chunk))
             stage_connector_spec = get_stage_connector_spec(
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
-                async_chunk=self._async_chunk,
+                async_chunk=stage_async_chunk,
+                async_chunk_input=getattr(stage_engine_args, "async_chunk_input", None),
+                async_chunk_output=getattr(stage_engine_args, "async_chunk_output", None),
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]

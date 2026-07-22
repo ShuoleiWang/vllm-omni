@@ -296,8 +296,26 @@ class AsyncOmniEngine:
         )
 
         self.num_stages = len(self.stage_configs)
-        stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
-        self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        input_modes: list[bool] = []
+        output_modes: list[bool] = []
+        for stage_id, stage_cfg in enumerate(self.stage_configs):
+            engine_args = getattr(stage_cfg, "engine_args", None)
+            legacy_mode = bool(getattr(engine_args, "async_chunk", False))
+            input_mode = getattr(engine_args, "async_chunk_input", None)
+            output_mode = getattr(engine_args, "async_chunk_output", None)
+            input_modes.append(legacy_mode if input_mode is None else bool(input_mode))
+            output_modes.append(legacy_mode if output_mode is None else bool(output_mode))
+            if stage_id == 0 and input_mode:
+                raise ValueError("Stage 0 cannot have async_chunk_input=True")
+            if stage_id == self.num_stages - 1 and output_mode:
+                raise ValueError("The final stage cannot have async_chunk_output=True")
+
+        for stage_id in range(max(0, self.num_stages - 1)):
+            if output_modes[stage_id] != input_modes[stage_id + 1]:
+                raise ValueError(f"Adjacent async_chunk directions disagree on edge {stage_id}->{stage_id + 1}")
+        self.edge_async_chunk = tuple(output_modes[:-1])
+        # Public compatibility flag: true when any pipeline edge streams.
+        self.async_chunk = any(self.edge_async_chunk)
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -442,6 +460,7 @@ class AsyncOmniEngine:
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
+                edge_async_chunk=self.edge_async_chunk,
                 pd_config=pd_config,
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,

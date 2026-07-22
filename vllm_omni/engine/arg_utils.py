@@ -159,6 +159,10 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
+    # Directional edge modes. ``None`` preserves compatibility with legacy
+    # configs where the single async_chunk bool controls both directions.
+    async_chunk_input: bool | None = None
+    async_chunk_output: bool | None = None
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -341,6 +345,8 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            async_chunk_input=self.async_chunk_input,
+            async_chunk_output=self.async_chunk_output,
             active_stream_window=self.active_stream_window,
             model_stage=self.model_stage,
             model_arch=self.model_arch,

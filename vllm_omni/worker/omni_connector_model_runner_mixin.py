@@ -102,6 +102,8 @@ class OmniConnectorModelRunnerMixin:
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
+        input_mode = getattr(model_config, "async_chunk_input", None)
+        self._async_chunk_input: bool = self._async_chunk if input_mode is None else bool(input_mode)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
         stage_id = getattr(model_config, "stage_id", 0)
         if isinstance(stage_id, str):
@@ -1060,7 +1062,7 @@ class OmniConnectorModelRunnerMixin:
         Skips requests whose batch data has already been received to
         prevent the bg thread from polling for non-existent chunks.
         """
-        if self._stage_id == 0:
+        if self._stage_id == 0 or (self._async_chunk and not self._async_chunk_input):
             return
         request_id = request.request_id
         # Explicit external_req_id=None must fall back to request_id;
@@ -1530,7 +1532,7 @@ class OmniConnectorModelRunnerMixin:
             return OmniConnectorOutput()
 
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        if self._async_chunk_input and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()

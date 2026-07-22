@@ -105,6 +105,13 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         assert omni_stage.runtime_config.num_replicas == legacy_stage.yaml_runtime.get("num_replicas", 1)
 
         engine_args = legacy_stage.yaml_engine_args
+        assert omni_stage.custom_process_input_func == legacy_stage.custom_process_input_func
+        assert omni_stage.custom_process_next_stage_input_func == engine_args.get(
+            "custom_process_next_stage_input_func"
+        )
+        assert omni_stage.model_config.async_chunk == engine_args["async_chunk"]
+        assert omni_stage.model_config.async_chunk_input == engine_args["async_chunk_input"]
+        assert omni_stage.model_config.async_chunk_output == engine_args["async_chunk_output"]
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
@@ -380,6 +387,9 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 
 def test_sub_config_fields_match_rfc_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
+        "async_chunk",
+        "async_chunk_input",
+        "async_chunk_output",
         "active_stream_window",
         "enable_sleep_mode",
         "default_sampling_params",

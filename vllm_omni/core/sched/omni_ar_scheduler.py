@@ -23,6 +23,8 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
+    uses_async_chunk_input,
+    uses_async_chunk_output,
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
@@ -81,8 +83,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
+        self._input_async_chunk = uses_async_chunk_input(model_config)
+        self._output_async_chunk = uses_async_chunk_output(model_config)
         self.chunk_transfer_adapter = None
-        if getattr(model_config, "async_chunk", False):
+        if self._input_async_chunk or self._output_async_chunk:
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self.input_coordinator: OmniSchedulingCoordinator | None = None
         if uses_full_payload_input_coordinator(model_config):
@@ -221,7 +225,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="ar")
         self._process_pending_input_timeouts()
 
-        if self.chunk_transfer_adapter:
+        if self._input_async_chunk and self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting, self.running, scheduler_requests=self.requests
             )
@@ -239,7 +243,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if deferred_waiting:
                     original_waiting.prepend_requests(deferred_waiting)
                 self.waiting = original_waiting
-            if self.chunk_transfer_adapter:
+            if self._input_async_chunk and self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(
                     self.waiting,
@@ -277,7 +281,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
-            if self.chunk_transfer_adapter:
+            if self._input_async_chunk and self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
@@ -444,7 +448,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if not finished:
                     # for streaming input request only
-                    if self.chunk_transfer_adapter:
+                    if self._input_async_chunk and self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
                             # Downstream async-chunk stages receive real payloads from the
                             # connector. This update only resumes polling for the next segment.
@@ -500,7 +504,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or is_segment_finished):
+            if (
+                self._output_async_chunk
+                and self.chunk_transfer_adapter is not None
+                and (inter_stage_output is not None or is_segment_finished)
+            ):
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,
@@ -529,7 +537,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                     )
                 )
-                if self.chunk_transfer_adapter is not None:
+                if self._input_async_chunk and self.chunk_transfer_adapter is not None:
                     self.chunk_transfer_adapter.cleanup_receiver(
                         request.request_id,
                     )
@@ -712,8 +720,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_output_placeholders = 0
             session.spec_token_ids = []
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
-            if self.vllm_config.model_config.stage_id != 0:
+            if self._output_async_chunk:
+                self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
+            if self._input_async_chunk and self.vllm_config.model_config.stage_id != 0:
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)

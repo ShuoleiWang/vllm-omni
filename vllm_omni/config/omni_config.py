@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    resolve_async_chunk_modes,
 )
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
@@ -55,6 +56,9 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 
 class _ModelEngineOverrides(TypedDict, total=False):
+    async_chunk: bool
+    async_chunk_input: bool
+    async_chunk_output: bool
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
@@ -180,21 +184,6 @@ def _first_defined(*values: Any) -> Any:
     return None
 
 
-def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
-    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
-    if (
-        deploy.async_chunk
-        and has_inter_stage_edges
-        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
-
-
 def _resolve_execution_mode(execution_type: StageExecutionType) -> tuple[StageType, str | None]:
     try:
         return _EXECUTION_TYPE_TO_STAGE_WORKER[execution_type]
@@ -214,6 +203,16 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
     return result
+
+
+def _async_chunk_model_overrides(edge_modes: tuple[bool, ...], stage_id: int) -> dict[str, bool]:
+    input_mode = stage_id > 0 and edge_modes[stage_id - 1]
+    output_mode = stage_id < len(edge_modes) and edge_modes[stage_id]
+    return {
+        "async_chunk": input_mode or output_mode,
+        "async_chunk_input": input_mode,
+        "async_chunk_output": output_mode,
+    }
 
 
 def _resolve_deploy_path(deploy_config_path: str) -> Path:
@@ -255,6 +254,9 @@ def _get_deploy_config(
 class OmniStageModelConfig:
     """Per-stage model behavior."""
 
+    async_chunk: bool = False
+    async_chunk_input: bool = False
+    async_chunk_output: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -736,7 +738,14 @@ def _global_stage_cli_fields() -> frozenset[str]:
         frozenset(f.name for f in fields(OmniEngineArgs))
         | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
         | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-    ) - {"model", "stage_id", "stage_configs_path", "async_chunk"}
+    ) - {
+        "model",
+        "stage_id",
+        "stage_configs_path",
+        "async_chunk",
+        "async_chunk_input",
+        "async_chunk_output",
+    }
 
 
 def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
@@ -763,10 +772,13 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     stage_cli_overrides: Mapping[str, Any] | None = None,
+    derived_model_overrides: Mapping[str, bool] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    if derived_model_overrides:
+        engine.update(_copy_value(derived_model_overrides))
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
@@ -945,7 +957,11 @@ def _build_common_stage_config_kwargs(
     engine: _StageEngineValues,
     parallel_config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> tuple[dict[str, Any], str | None, str | None]:
-    input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
+    input_proc, next_stage_proc = _select_processor_funcs(
+        topology,
+        bool(engine.model.get("async_chunk_input")),
+        bool(engine.model.get("async_chunk_output")),
+    )
     quantization_config = _build_quantization_config(deploy, engine.quantization)
     parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 
@@ -1260,7 +1276,7 @@ class VllmOmniConfig:
         deploy = _apply_platform_overrides(deploy)
         if len(pipeline_cfg.stages) <= 1:
             deploy.async_chunk = False
-        _validate_async_chunk_support(pipeline_cfg, deploy)
+        edge_modes = resolve_async_chunk_modes(pipeline_cfg, deploy)
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
 
@@ -1273,10 +1289,11 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _async_chunk_model_overrides(edge_modes, stage_index),
                 ),
                 model=model,
             )
-            for topology in pipeline_cfg.stages
+            for stage_index, topology in enumerate(pipeline_cfg.stages)
         )
 
         orchestrator_config = VllmOmniOrchestratorConfig(

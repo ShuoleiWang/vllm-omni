@@ -29,6 +29,10 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+# Computed from pipeline topology. Accepting user overrides could make the
+# producer and consumer disagree and wait forever for chunks that never come.
+_DERIVED_STAGE_ENGINE_FIELDS = frozenset({"async_chunk_input", "async_chunk_output"})
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -69,7 +73,9 @@ def build_stage_runtime_overrides(
         # the default blacklist for true orchestrator/shared fields while
         # allowing any field explicitly represented by the deploy schema to
         # continue flowing into per-stage overrides.
-        internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        internal_keys = (
+            internal_blacklist_keys() | SHARED_FIELDS | _DERIVED_STAGE_ENGINE_FIELDS
+        ) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
 
@@ -223,7 +229,8 @@ class StagePipelineConfig:
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
+    # Alternates picked by ``merge_pipeline_deploy`` from the resolved incoming
+    # and outgoing edge modes.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     prompt_expand_func: str | None = None
@@ -728,16 +735,58 @@ def _resolve_execution_mode(
 
 def _select_processor_funcs(
     ps: StagePipelineConfig,
-    async_chunk: bool,
+    input_async_chunk: bool,
+    output_async_chunk: bool,
 ) -> tuple[str | None, str | None]:
-    """Pick ``(input_proc, next_stage_proc)`` based on the async_chunk mode."""
+    """Pick processors from the independently resolved edge directions.
+
+    ``input_async_chunk`` controls how this stage consumes its upstream edge;
+    ``output_async_chunk`` controls how it produces its downstream edge.  They
+    are intentionally independent for middle stages in a hybrid pipeline.
+    """
     next_stage_proc = ps.custom_process_next_stage_input_func
     input_proc = ps.custom_process_input_func
-    if async_chunk and ps.async_chunk_process_next_stage_input_func:
+    if output_async_chunk and ps.async_chunk_process_next_stage_input_func:
         next_stage_proc = ps.async_chunk_process_next_stage_input_func
-    elif not async_chunk and ps.sync_process_input_func:
+    if not input_async_chunk and ps.sync_process_input_func:
         input_proc = ps.sync_process_input_func
     return input_proc, next_stage_proc
+
+
+def resolve_async_chunk_modes(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+) -> tuple[bool, ...]:
+    """Resolve adjacent streaming edges for the supported linear data plane.
+
+    ``deploy.async_chunk`` enables every edge whose source stage declares an
+    async producer. This preserves existing all-streaming pipelines while
+    allowing a synchronous prefix followed by a streaming suffix.
+    """
+    edge_count = max(0, len(pipeline.stages) - 1)
+    if not deploy.async_chunk or edge_count == 0:
+        return (False,) * edge_count
+
+    for index, stage in enumerate(pipeline.stages):
+        expected_sources = () if index == 0 else (index - 1,)
+        if stage.stage_id != index or stage.input_sources != expected_sources:
+            raise ValueError(
+                "async_chunk currently requires a contiguous linear pipeline; "
+                f"stage index {index} has id={stage.stage_id} and "
+                f"input_sources={stage.input_sources}"
+            )
+
+    modes = tuple(bool(stage.async_chunk_process_next_stage_input_func) for stage in pipeline.stages[:-1])
+    if not any(modes):
+        raise ValueError(
+            f"Pipeline {pipeline.model_type!r} has async_chunk=True but no source "
+            "stage declares async_chunk_process_next_stage_input_func"
+        )
+    if any(enabled and not later for enabled, later in zip(modes, modes[1:])):
+        raise ValueError(
+            "async_chunk edges must form a streaming suffix; switching back to a synchronous edge is unsupported"
+        )
+    return modes
 
 
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
@@ -763,6 +812,8 @@ def _build_engine_args(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
     next_stage_proc: str | None,
+    input_async_chunk: bool,
+    output_async_chunk: bool,
 ) -> dict[str, Any]:
     """Assemble the flat ``yaml_engine_args`` dict for one stage.
 
@@ -798,9 +849,13 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    # Materialize the resolved pipeline-wide async_chunk value into every
-    # stage so explicit False overrides do not get lost downstream.
-    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    # Keep ``async_chunk`` as the legacy "this stage participates in chunk
+    # transfer" marker while retaining directionality for schedulers and the
+    # orchestrator. Legacy configs without the directional fields continue to
+    # fall back to the old bool in engine/runtime code.
+    engine_args["async_chunk_input"] = input_async_chunk
+    engine_args["async_chunk_output"] = output_async_chunk
+    engine_args["async_chunk"] = input_async_chunk or output_async_chunk
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
@@ -847,35 +902,28 @@ def merge_pipeline_deploy(
     if len(pipeline.stages) <= 1:
         deploy.async_chunk = False
 
-    # async_chunk only applies to multi-stage pipelines: a pipeline with no
-    # consumer stages (every stage has empty input_sources) has no inter-stage
-    # edges, so async_chunk is a no-op and we skip the check entirely.
-    # For pipelines that DO have inter-stage edges, require a dedicated per-step
-    # async producer (``async_chunk_process_next_stage_input_func``).
-    # ``custom_process_next_stage_input_func`` is the full-payload / connector-path
-    # producer and does NOT imply async_chunk support — pipelines like qwen2_5_omni
-    # and covo_audio have it but removed their consumer-side ``custom_process_input_func``
-    # because they don't support async_chunk, so accepting them here would silently
-    # miswire the consumer stage instead of raising a clear error.
-    _has_inter_stage_edges = any(ps.input_sources for ps in pipeline.stages)
-    if (
-        deploy.async_chunk
-        and _has_inter_stage_edges
-        and not any(ps.async_chunk_process_next_stage_input_func for ps in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
+    edge_modes = resolve_async_chunk_modes(pipeline, deploy)
 
     result: list[StageConfig] = []
-    for ps in pipeline.stages:
+    for stage_index, ps in enumerate(pipeline.stages):
         ds = deploy_by_id.get(ps.stage_id)
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
-        input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
-        engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        input_async_chunk = stage_index > 0 and edge_modes[stage_index - 1]
+        output_async_chunk = stage_index < len(edge_modes) and edge_modes[stage_index]
+        input_proc, next_stage_proc = _select_processor_funcs(
+            ps,
+            input_async_chunk,
+            output_async_chunk,
+        )
+        engine_args = _build_engine_args(
+            ps,
+            ds,
+            pipeline,
+            deploy,
+            next_stage_proc,
+            input_async_chunk,
+            output_async_chunk,
+        )
         sched_cls = _resolve_scheduler(
             ps.execution_type,
             engine_args.get("async_scheduling", True),

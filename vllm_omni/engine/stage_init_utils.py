@@ -1053,13 +1053,29 @@ def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
     async_chunk: bool,
+    *,
+    async_chunk_input: bool | None = None,
+    async_chunk_output: bool | None = None,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
+    """Select the connector used by this stage's chunk-transfer adapter."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+
+    if async_chunk_input is not None or async_chunk_output is not None:
+        input_mode = bool(async_chunk_input)
+        output_mode = bool(async_chunk_output)
+        if output_mode and not input_mode:
+            if omni_transfer_config is None:
+                return {}
+            connector = omni_transfer_config.get_connector_for_edge(str(stage_id), str(stage_id + 1))
+            if connector is None:
+                return {}
+            extra = dict(connector.extra or {})
+            extra["role"] = "sender"
+            return {"name": connector.name, "extra": extra}
+        async_chunk = input_mode
 
     if not async_chunk:
         return {}
-
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         return dict(cfg.get("spec", {}))
