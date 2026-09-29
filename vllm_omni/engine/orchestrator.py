@@ -26,6 +26,7 @@ from typing import Any
 import janus
 import torch
 from vllm.config import ModelConfig
+from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
@@ -37,7 +38,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
@@ -1858,6 +1859,35 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
+    def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> None:
+        """Bind the receiving replica before this stage's multimodal processing.
+
+        A replicated stage has one processor (sender cache) but a separate
+        receiver cache per replica, so a plain content hash lets the sender omit
+        a tensor for a replica that never received it. Binding first and scoping
+        the keys to that replica keeps reuse inside the receiver that owns it,
+        as the engine already does for stage 0.
+        """
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+            return
+        pool = self.stage_pools[stage_id]
+        if pool.live_num_replicas <= 1:
+            return
+        replica_id = pool.preselect_replica_id(req_id)
+        if replica_id is None:
+            return
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        mm_config = getattr(model_config, "multimodal_config", None)
+        for item in prompts:
+            scope_stage_replica_mm_uuids(
+                item,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                model_id=str(getattr(model_config, "model", "")),
+                mm_hasher_algorithm=getattr(mm_config, "mm_hasher_algorithm", None) or "blake3",
+            )
+
     def _build_entry_stage_request(
         self,
         req_id: str,
@@ -1871,6 +1901,7 @@ class OrchestratorBase:
         so it stays the only multimodal cache sender of the stage's engine core
         (vLLM mirrors the sender and engine-core caches in submission order).
         """
+        self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
         processor = self._get_stage_input_processor(stage_id)
         request = processor.process_inputs(
             request_id=req_id,
@@ -1911,6 +1942,7 @@ class OrchestratorBase:
             request.payload_sender_info = payload_sender_info
             return request
 
+        self._scope_stage_mm_cache_to_replica(req_id, next_stage_id, next_input)
         processor = self._get_stage_input_processor(next_stage_id)
         # A pooling stage is driven by PoolingParams; vLLM validates them against
         # the stage's supported tasks, so advertise the model's pooling tasks (or
@@ -2474,15 +2506,27 @@ class OrchestratorBase:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = self._build_next_stage_request(
-                req_id,
-                next_logical,
-                next_input,
-                params=params,
-                mm_features=mm_features,
-                resumable=next_stage_resumable,
-                payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
-            )
+            try:
+                request = self._build_next_stage_request(
+                    req_id,
+                    next_logical,
+                    next_input,
+                    params=params,
+                    mm_features=mm_features,
+                    resumable=next_stage_resumable,
+                    payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
+                )
+            except (ValueError, VLLMClientError) as exc:
+                # The forwarded input failed this stage's own validation (e.g. more
+                # visual tokens than it accepts), which stage 0 would have rejected
+                # at admission: fail only this request, as the bypass entry does.
+                logger.warning(
+                    "[Orchestrator] req=%s: stage-%s rejected the forwarded input: %s", req_id, next_logical, exc
+                )
+                await self._fail_request_client_error(
+                    req_id, next_logical, str(exc), release_owners=req_state.session_owned
+                )
+                return
 
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)

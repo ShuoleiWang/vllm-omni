@@ -615,6 +615,21 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         await _shutdown_orchestrator(orchestrator_fixture)
 
 
+def _processed_request(request_id: str, params) -> EngineCoreRequest:
+    """What a stage input processor returns for a raw prompt in the entry-stage tests."""
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[4, 5, 6],
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
     """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
@@ -631,17 +646,7 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
 
     def process_inputs(*, request_id, prompt, params, **kwargs):
         processed_prompts.append(prompt)
-        return EngineCoreRequest(
-            request_id=request_id,
-            prompt_token_ids=[4, 5, 6],
-            mm_features=None,
-            sampling_params=params,
-            pooling_params=None,
-            arrival_time=0.0,
-            lora_request=None,
-            cache_salt=None,
-            data_parallel_rank=None,
-        )
+        return _processed_request(request_id, params)
 
     orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
 
@@ -666,6 +671,39 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
         assert stage0.add_request_calls == []
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
+    """The same image reaching a replicated stage 1 through the bypass entry and the
+    forwarded path is keyed per receiving replica: each replica owns a separate receiver
+    cache, so a shared key would let the sender omit a tensor the other replica never got."""
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        StagePool(0, [FakeStageClient()]),
+        StagePool(1, [FakeStageClient(final_output=True), FakeStageClient(final_output=True)]),
+    ]
+    seen_uuids: dict[str, str] = {}
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        seen_uuids[request_id] = prompt["multi_modal_uuids"]["image"][0]
+        return _processed_request(request_id, params)
+
+    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs=process_inputs)}
+    req_state = SimpleNamespace(
+        sampling_params_list=[_sampling_params(), _sampling_params()], request_timestamp=0.0, final_stage_id=1
+    )
+    orchestrator._build_entry_stage_request(
+        "req-bypass", 1, {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}, req_state
+    )
+    orchestrator._build_next_stage_request(
+        "req-forwarded", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
+    )
+
+    stage1_pool = orchestrator.stage_pools[1]
+    for req_id, uuid in seen_uuids.items():
+        assert uuid.startswith(f"stage1:rep{stage1_pool.get_bound_replica_id(req_id)}:")
+    assert seen_uuids["req-bypass"] != seen_uuids["req-forwarded"]
+    assert seen_uuids["req-bypass"].split(":", 2)[2] == seen_uuids["req-forwarded"].split(":", 2)[2]
 
 
 @pytest.mark.asyncio

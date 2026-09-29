@@ -1068,10 +1068,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         *,
         prompt_extras: dict[str, Any],
     ) -> tuple[list[list[ConversationMessage]], list[TokPrompt]]:
-        """``render_chat_async`` without its multimodal-processing step: a bypassing
-        request keeps its media raw for the orchestrator (``_build_entry_stage_request``)."""
+        """Upstream ``render_chat_async`` minus ``process_for_engine_async``: a bypassing
+        request keeps its media raw for the orchestrator (``_build_entry_stage_request``),
+        which processes it with the same prompt extras, ``media_io_kwargs`` included."""
         rendered = await asyncio.gather(*(renderer.render_messages_async(c, chat_params) for c in conversations))
         tok_prompts = await renderer.tokenize_prompts_async([prompt for _, prompt in rendered], tok_params)
+        prompt_extras = {**prompt_extras, "media_io_kwargs": chat_params.media_io_kwargs or {}}
         for tok_prompt in tok_prompts:
             tok_prompt.update(prompt_extras)
         return [conversation for conversation, _ in rendered], tok_prompts

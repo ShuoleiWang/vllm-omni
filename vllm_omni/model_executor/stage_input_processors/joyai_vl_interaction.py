@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stage input processors of the native JoyAI-VL-Interaction pipelines.
-
-``asr_to_joyai`` builds JoyAI inputs from Qwen3-ASR transcripts (audio-input
-profile); ``joyai_action_to_tts`` builds Qwen3-TTS Talker inputs from
-completed JoyAI actions.
-"""
+"""Build JoyAI inputs from Qwen3-ASR transcripts and Qwen3-TTS Talker inputs from JoyAI actions."""
 
 from typing import Any
 
@@ -38,11 +33,11 @@ _IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 _VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
-def _extract_completed_text(stage_output: RequestOutput) -> str:
-    """Return a completed stage's text, using cumulative text when available."""
-    completion = stage_output.outputs[0]
-    text = getattr(completion, "cumulative_text", None) or completion.text
-    return text if isinstance(text, str) else ""
+def _extract_completed_action_text(joyai_output: RequestOutput) -> str:
+    """Return the final JoyAI action text, using cumulative text when available."""
+    completion = joyai_output.outputs[0]
+    action_text = getattr(completion, "cumulative_text", None) or completion.text
+    return action_text if isinstance(action_text, str) else ""
 
 
 def _clean_qwen3_asr_transcript(raw_text: str) -> str:
@@ -80,7 +75,7 @@ def asr_to_joyai(
         request_prompt = request_prompt if isinstance(request_prompt, dict) else {}
         additional_info = request_prompt.get("additional_information") or {}
         system_prompt = str(first_value(additional_info.get("joyai_system_prompt"), DEFAULT_SYSTEM_PROMPT))
-        transcript = _clean_qwen3_asr_transcript(_extract_completed_text(asr_output))
+        transcript = _clean_qwen3_asr_transcript(_extract_completed_action_text(asr_output))
         visual_inputs = _visual_inputs(request_prompt)
         user_turn = f"{USER_QUERY_HEADER}\n{transcript}" if transcript else ""
         user_turn += _IMAGE_PLACEHOLDER * len(visual_inputs.get("image", ()))
@@ -179,7 +174,7 @@ def joyai_action_to_tts(
     request_prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
     talker_inputs: list[OmniTokensPrompt] = []
     for request_index, joyai_output in enumerate(source_outputs):
-        parsed_action = parse_action(_extract_completed_text(joyai_output))
+        parsed_action = parse_action(_extract_completed_action_text(joyai_output))
         if not parsed_action.spoke or not parsed_action.text:
             continue
 

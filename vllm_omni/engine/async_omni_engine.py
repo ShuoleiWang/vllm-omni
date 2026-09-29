@@ -20,6 +20,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
     apply_omni_final_stage_metadata,
     inject_global_id,
+    scope_stage_replica_mm_uuids,
     upgrade_to_omni_request,
 )
 from vllm_omni.engine.messages import (
@@ -42,14 +43,6 @@ class AsyncOmniEngine(OmniEngineBase):
         return Orchestrator(**orchestrator_kwargs)
 
     # ---- request helpers ----
-
-    @staticmethod
-    def _iter_multimodal_items(value: Any) -> list[Any]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return value
-        return [value]
 
     _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
 
@@ -87,72 +80,14 @@ class AsyncOmniEngine(OmniEngineBase):
 
         return getattr(mm_config, "mm_hasher_algorithm", None) or self._DEFAULT_MM_HASHER_ALGORITHM
 
-    def _ensure_stage_replica_mm_uuids(
-        self,
-        prompt: Any,
-        *,
-        stage_id: int,
-        replica_id: int,
-    ) -> None:
-        """Make multimodal processor-cache keys local to a stage replica.
-
-        vLLM's frontend multimodal sender cache is process-global, while each
-        vllm-omni stage replica owns a separate EngineCore receiver cache. If
-        two requests with the same image are routed to different stage-0
-        replicas, a plain content hash can make the sender omit the tensor for
-        a replica that has never received it. Prefixing user/content UUIDs with
-        the selected replica keeps cache reuse within the receiver that owns it.
-        """
-
-        if not isinstance(prompt, dict):
-            return
-
-        mm_data = prompt.get("multi_modal_data")
-        if not isinstance(mm_data, dict) or not mm_data:
-            return
-
-        from vllm.multimodal.hasher import MultiModalHasher
-
-        mm_hasher_algorithm = self._resolve_mm_hasher_algorithm()
-
-        existing_uuids = prompt.get("multi_modal_uuids")
-        if not isinstance(existing_uuids, dict):
-            existing_uuids = {}
-
-        model_id = str(getattr(self, "model", ""))
-        scoped_uuids: dict[str, list[str | None]] = dict(existing_uuids)
-        for modality, raw_items in mm_data.items():
-            items = self._iter_multimodal_items(raw_items)
-            if not items:
-                continue
-
-            modality_existing = existing_uuids.get(modality)
-            if not isinstance(modality_existing, list):
-                modality_existing = [modality_existing] if modality_existing is not None else []
-
-            modality_uuids: list[str | None] = []
-            for idx, item in enumerate(items):
-                user_uuid = modality_existing[idx] if idx < len(modality_existing) else None
-                if user_uuid is not None:
-                    base_uuid = str(user_uuid)
-                elif item is None:
-                    base_uuid = None
-                else:
-                    base_uuid = MultiModalHasher.hash_kwargs(
-                        mm_hasher_algorithm,
-                        model_id=model_id,
-                        **{modality: item},
-                    )
-
-                if base_uuid is None:
-                    modality_uuids.append(None)
-                else:
-                    modality_uuids.append(f"stage{stage_id}:rep{replica_id}:{base_uuid}")
-
-            scoped_uuids[modality] = modality_uuids
-
-        if scoped_uuids:
-            prompt["multi_modal_uuids"] = scoped_uuids
+    def _ensure_stage_replica_mm_uuids(self, prompt: Any, *, stage_id: int, replica_id: int) -> None:
+        scope_stage_replica_mm_uuids(
+            prompt,
+            stage_id=stage_id,
+            replica_id=replica_id,
+            model_id=str(getattr(self, "model", "")),
+            mm_hasher_algorithm=self._resolve_mm_hasher_algorithm(),
+        )
 
     @staticmethod
     def _stage_pool_replica_count(stage_pool: Any) -> int:

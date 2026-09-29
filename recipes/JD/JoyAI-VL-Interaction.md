@@ -270,17 +270,12 @@ on GPU 0 by the provided
 
 ### Audio input: opt-in native ASR profile
 
-A second deploy profile takes spoken input natively, without the external ASR bridge, while
-still serving the text/video requests above from the same deployment:
+A second deploy profile takes spoken input natively, without the external ASR bridge, and
+still serves the text/video requests above from the same deployment:
 
 ```text
-request with audio (+ image/video, optional standing instruction)
-  -> Qwen3-ASR transcript
-  -> JoyAI complete action text -> Qwen3-TTS Talker -> Code2Wav -> 24 kHz audio
-
-request without audio (text and/or image/video)
-  -> JoyAI complete action text -> Qwen3-TTS Talker -> Code2Wav -> 24 kHz audio
-     (the ASR stage is bypassed: no synthetic audio, no ASR inference)
+with audio:    Qwen3-ASR transcript -> JoyAI action -> Qwen3-TTS Talker -> Code2Wav
+without audio: JoyAI action -> Qwen3-TTS Talker -> Code2Wav   (the ASR stage is skipped)
 ```
 
 ```bash
@@ -289,11 +284,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
   --port 8092
 ```
 
-Send the spoken query as an `input_audio` / `audio_url` part next to the frames or video.
-The frontend routes the audio to Qwen3-ASR and defers the image/video parts to JoyAI, where
-the transcript is presented under the same `[User Query ...]` header the Day-0 controller
-uses, followed by the original visual inputs, so the `silence` / `response` / `delegate`
-semantics and the speech routing above are unchanged:
+Send the spoken query as an `input_audio` / `audio_url` part next to the frames or video:
 
 ```bash
 curl -s http://127.0.0.1:8092/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -306,24 +297,14 @@ curl -s http://127.0.0.1:8092/v1/chat/completions -H 'content-type: application/
   }'
 ```
 
-For a request with audio, JoyAI's default system prompt is used unless
-`additional_information.joyai_system_prompt` replaces it; a `system` message and any text
-parts are consumed by Qwen3-ASR's chat template (as transcription context), not by JoyAI.
-When the transcript is empty, JoyAI only sees the visual inputs. The `voice`, `language`,
-`tts_speaker`, and `tts_language` fields behave as in the text/video profile.
+- With audio, JoyAI sees the transcript under the Day-0 `[User Query ...]` header, followed
+  by the images/video, so `silence` / `response` / `delegate` behave as above. A `system`
+  message and text parts go to Qwen3-ASR as transcription context; set
+  `additional_information.joyai_system_prompt` to replace JoyAI's default system prompt.
+- Without audio, the request never reaches the ASR stage and is rendered for JoyAI exactly
+  as in the text/video profile.
+- In both cases, sampling parameters and the `voice` / `language` fields apply as in the
+  text/video profile.
 
-A request without an audio part never reaches the ASR stage: it is rendered with the JoyAI
-chat template exactly as in the text/video profile (system message, text parts, and
-image/video parts included) and submitted to the JoyAI stage directly. The ASR stage
-declares `bypass_without_modalities=("audio",)` in the pipeline definition; the routing
-decision is per request and needs no client-side flag. In both cases the request's sampling
-parameters (`temperature`, `max_tokens`, ...) apply to JoyAI; Qwen3-ASR decodes with its
-deploy-config defaults.
-
-The JoyAI stage's input processor is built lazily on the orchestrator side, so the first
-request that reaches it (with or without audio) pays a one-off ~16–18 s setup cost; send a
-warm-up request after startup.
-
-The existing text/video profile and the Day-0 orchestrator with its external ASR bridge
-remain available. The Day-0 controller, VAD/commit policy, session memory, and delegated
-Agent execution stay outside this request-scoped pipeline.
+The first request that reaches JoyAI pays a one-off setup of about 22 s, because its input
+processor is built lazily; send a warm-up request after startup.
