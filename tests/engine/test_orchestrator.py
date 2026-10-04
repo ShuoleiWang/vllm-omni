@@ -40,7 +40,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -673,10 +673,41 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
         await _shutdown_orchestrator(orchestrator_fixture)
 
 
+@pytest.mark.asyncio
+async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) -> None:
+    """With stage 0 bypassed, async-chunk prewarm starts after the entry stage."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage2 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1, stage2], async_chunk=True)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params)
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-bypass-async",
+            prompt={"prompt_token_ids": [1, 2, 3]},
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+            entry_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage2.add_request_calls) == 1)
+        assert stage1.add_request_calls[0][0].prompt_token_ids == [4, 5, 6]
+        assert all(token_id == 0 for token_id in stage2.add_request_calls[0][0].prompt_token_ids)
+        assert stage0.add_request_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
 def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     """The same image reaching a replicated stage 1 through the bypass entry and the
     forwarded path is keyed per receiving replica: each replica owns a separate receiver
-    cache, so a shared key would let the sender omit a tensor the other replica never got."""
+    cache, so a shared key would let the sender omit a tensor the other replica never got.
+    With no replica to bind yet, processing fails instead of using unscoped keys."""
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [
         StagePool(0, [FakeStageClient()]),
@@ -704,6 +735,14 @@ def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
         assert uuid.startswith(f"stage1:rep{stage1_pool.get_bound_replica_id(req_id)}:")
     assert seen_uuids["req-bypass"] != seen_uuids["req-forwarded"]
     assert seen_uuids["req-bypass"].split(":", 2)[2] == seen_uuids["req-forwarded"].split(":", 2)[2]
+
+    # A distributed pool whose snapshot has no UP replica yet cannot bind one.
+    stage1_pool.preselect_replica_id = lambda req_id: None
+    with pytest.raises(StageUnavailableError):
+        orchestrator._build_next_stage_request(
+            "req-unbound", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
+        )
+    assert "req-unbound" not in seen_uuids
 
 
 @pytest.mark.asyncio

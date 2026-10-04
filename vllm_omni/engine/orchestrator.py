@@ -200,6 +200,8 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    # Stage the request was admitted to; > 0 when the stages before it are bypassed.
+    entry_stage_id: int = 0
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
@@ -1876,7 +1878,9 @@ class OrchestratorBase:
             return
         replica_id = pool.preselect_replica_id(req_id)
         if replica_id is None:
-            return
+            # No serviceable replica yet (distributed mode): unscoped keys could let the
+            # sender omit media for the replica that ends up receiving the request.
+            raise StageUnavailableError(f"stage {stage_id} has no serviceable replica to bind")
         model_config = getattr(pool.stage_vllm_config, "model_config", None)
         mm_config = getattr(model_config, "multimodal_config", None)
         for item in prompts:
@@ -2553,19 +2557,20 @@ class OrchestratorBase:
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
-        stage0_request: Any,
+        entry_request: Any,
         req_state: OrchestratorRequestState,
     ) -> bool:
-        """Pre-submit downstream stages for async-chunk mode.
+        """Pre-submit the stages after the request's entry stage for async-chunk mode.
 
         Returns False when the request was failed and cleaned up in here, so a
         caller still holding ``req_state`` stops instead of recording state on
         an object the cleanup already popped from ``request_states``.
         """
-        if req_state.final_stage_id <= 0:
+        entry_stage_id = req_state.entry_stage_id
+        if req_state.final_stage_id <= entry_stage_id:
             return True
 
-        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
+        prompt_token_ids = getattr(entry_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
             # R1.3 of #4855. Skipping the prewarm leaves every downstream stage
             # unsubmitted, so the request produces no output and no error -- it
@@ -2581,20 +2586,20 @@ class OrchestratorBase:
             # either. This is the same shape `_handle_stage_error` uses for a
             # request-scoped client error.
             logger.error(
-                "[Orchestrator] req=%s: async_chunk prewarm needs stage0 prompt_token_ids "
+                "[Orchestrator] req=%s: async_chunk prewarm needs entry-stage prompt_token_ids "
                 "and none were provided; failing the request",
                 request_id,
             )
             await self._fail_request_client_error(
                 request_id,
-                0,
-                "async_chunk requires prompt_token_ids on the stage-0 request; "
+                entry_stage_id,
+                "async_chunk requires prompt_token_ids on the entry-stage request; "
                 "an embeds-only prompt cannot prewarm downstream stages",
                 release_owners=True,
             )
             return False
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for next_stage_id in range(entry_stage_id + 1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
             if not self._stage_receives_async_chunks(next_stage_id):
@@ -2656,7 +2661,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -2887,6 +2892,7 @@ class Orchestrator(OrchestratorBase):
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            entry_stage_id=stage_id,
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
@@ -2907,6 +2913,9 @@ class Orchestrator(OrchestratorBase):
             _t_preprocess = _time.perf_counter()
             try:
                 prompt = self._build_entry_stage_request(request_id, stage_id, prompt, req_state)
+            except StageUnavailableError:
+                await self._fail_request_dead_stage(request_id, stage_id)
+                return
             except Exception as exc:
                 # Rejected input (too long, invalid media, ...), which the stage-0
                 # path raises before admission: fail only this request.
@@ -2927,12 +2936,11 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
-        stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
         final_stage_id = msg.final_stage_id
@@ -2950,6 +2958,7 @@ class Orchestrator(OrchestratorBase):
             )
             return
 
+        stage_id = req_state.entry_stage_id
         if msg.sampling_params_list:
             req_state.sampling_params_list = msg.sampling_params_list
 
@@ -2968,7 +2977,7 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
