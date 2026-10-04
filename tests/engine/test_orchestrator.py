@@ -704,10 +704,8 @@ async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) 
 
 
 def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
-    """The same image reaching a replicated stage 1 through the bypass entry and the
-    forwarded path is keyed per receiving replica: each replica owns a separate receiver
-    cache, so a shared key would let the sender omit a tensor the other replica never got.
-    With no replica to bind yet, processing fails instead of using unscoped keys."""
+    """The same image reaching a replicated stage 1 by either path is keyed per receiving
+    replica, and processing fails while no replica can be bound."""
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [
         StagePool(0, [FakeStageClient()]),

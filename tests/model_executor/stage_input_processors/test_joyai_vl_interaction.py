@@ -52,7 +52,7 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
             {
                 "mm_processor_kwargs": {"fps": 1},
                 "additional_information": {
-                    "deferred_multi_modal_data": {"video": ("frames", {"fps": 1})},
+                    "deferred_multi_modal_data": {"video": [("frames", {"fps": 1})]},
                     "joyai_system_prompt": ["Watch the feed."],
                 },
             },

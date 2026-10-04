@@ -69,10 +69,8 @@ JOYAI_VL_INTERACTION_PIPELINE = PipelineConfig(
 
 _JOYAI_STAGE, *_JOYAI_TTS_STAGES = JOYAI_VL_INTERACTION_PIPELINE.stages
 
-# Opt-in audio-input profile: Qwen3-ASR transcribes the request audio and the
-# ASR-to-JoyAI processor combines the transcript with the image/video inputs
-# the frontend deferred past the ASR stage. A request without audio bypasses
-# stage 0 and enters at the JoyAI stage, so one deployment serves both.
+# Opt-in audio-input profile: Qwen3-ASR transcribes the audio for JoyAI; a request
+# without audio bypasses stage 0 and enters at JoyAI, so one deployment serves both.
 JOYAI_VL_INTERACTION_ASR_PIPELINE = PipelineConfig(
     model_type="joyai_vl_interaction_asr",
     model_arch="Qwen3ASRForConditionalGeneration",

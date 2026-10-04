@@ -45,29 +45,13 @@ def _clean_qwen3_asr_transcript(raw_text: str) -> str:
     return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
 
 
-def _visual_inputs(request_prompt: dict[str, Any]) -> dict[str, list[Any]]:
-    """Return the image/video inputs the frontend deferred past the ASR stage."""
-    additional_info = request_prompt.get("additional_information") or {}
-    media = dict(request_prompt.get("multi_modal_data") or {})
-    media.update(additional_info.get("deferred_multi_modal_data") or {})
-    return {
-        modality: items if isinstance(items, list) else [items]
-        for modality in ("image", "video")
-        if (items := media.get(modality)) is not None
-    }
-
-
 def asr_to_joyai(
     source_outputs: list[RequestOutput],
     prompt: object | None = None,
     requires_multimodal_data: bool = True,
 ) -> list[dict[str, Any]]:
-    """Build JoyAI inputs from Qwen3-ASR transcripts and the original visual inputs.
-
-    The transcript becomes JoyAI's user query (laid out as the Day-0 interaction
-    server does), followed by the deferred image/video inputs. The system prompt
-    is JoyAI's unless ``additional_information["joyai_system_prompt"]`` is set.
-    """
+    """Build JoyAI prompts from Qwen3-ASR transcripts and the deferred image/video inputs;
+    ``additional_information["joyai_system_prompt"]`` overrides the default system prompt."""
     request_prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
     joyai_inputs: list[dict[str, Any]] = []
     for request_index, asr_output in enumerate(source_outputs):
@@ -76,7 +60,8 @@ def asr_to_joyai(
         additional_info = request_prompt.get("additional_information") or {}
         system_prompt = str(first_value(additional_info.get("joyai_system_prompt"), DEFAULT_SYSTEM_PROMPT))
         transcript = _clean_qwen3_asr_transcript(_extract_completed_action_text(asr_output))
-        visual_inputs = _visual_inputs(request_prompt)
+        deferred = additional_info.get("deferred_multi_modal_data") or {}
+        visual_inputs = {modality: deferred[modality] for modality in ("image", "video") if deferred.get(modality)}
         user_turn = f"{USER_QUERY_HEADER}\n{transcript}" if transcript else ""
         user_turn += _IMAGE_PLACEHOLDER * len(visual_inputs.get("image", ()))
         user_turn += _VIDEO_PLACEHOLDER * len(visual_inputs.get("video", ()))

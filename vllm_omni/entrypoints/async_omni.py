@@ -157,7 +157,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
             entry_stage_id: Stage the request is submitted to; > 0 bypasses
-                stage 0 and leaves the prompt raw for that stage.
+                stage 0 and leaves the prompt raw for that stage. Streaming
+                prompts always enter at stage 0.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.

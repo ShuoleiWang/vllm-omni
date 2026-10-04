@@ -2016,14 +2016,7 @@ class OrchestratorBase:
         )
 
     def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> None:
-        """Bind the receiving replica before this stage's multimodal processing.
-
-        A replicated stage has one processor (sender cache) but a separate
-        receiver cache per replica, so a plain content hash lets the sender omit
-        a tensor for a replica that never received it. Binding first and scoping
-        the keys to that replica keeps reuse inside the receiver that owns it,
-        as the engine already does for stage 0.
-        """
+        """Bind the receiving replica before multimodal processing and scope the cache keys to it."""
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
             return
@@ -2053,12 +2046,8 @@ class OrchestratorBase:
         prompt: Any,
         req_state: OrchestratorRequestState,
     ) -> Any:
-        """Process the raw prompt of a request that bypasses stage 0.
-
-        This stage's input processor also prepares the prompts forwarded to it,
-        so it stays the only multimodal cache sender of the stage's engine core
-        (vLLM mirrors the sender and engine-core caches in submission order).
-        """
+        """Process a bypassing request's raw prompt with the input processor that also prepares the
+        prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
         self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
         processor = self._get_stage_input_processor(stage_id)
         request = processor.process_inputs(
@@ -3042,7 +3031,7 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
         if not self.stage_pools[stage_id].live_replica_ids():
-            # Stage 0 lost all replicas between the HTTP-layer errored check and
+            # The entry stage lost all replicas between the HTTP-layer errored check and
             # dispatch. Runs before request state / running counter registration,
             # so the helper's cleanup is a no-op here.
             await self._fail_request_dead_stage(request_id, stage_id)
@@ -3089,7 +3078,6 @@ class Orchestrator(OrchestratorBase):
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
@@ -3110,6 +3098,7 @@ class Orchestrator(OrchestratorBase):
                 await self._fail_request_client_error(request_id, stage_id, str(exc))
                 return
             req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
+        req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_initial(
                 request_id,

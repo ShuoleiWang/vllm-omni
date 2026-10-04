@@ -168,7 +168,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
-    # Opt-in audio-input profile (deploy/joyai_vl_interaction_asr.yaml): Qwen3-ASR before JoyAI.
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,

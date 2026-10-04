@@ -154,9 +154,8 @@ def upgrade_to_omni_request(
         raw_buffer = raw_prompt.get("model_intermediate_buffer")
         if isinstance(raw_info, dict):
             wire_payload = dict(raw_info)
-            # The deferred image/video stays on the original prompt, which the
-            # orchestrator reads in-process; keep it off the wire, where PIL
-            # images and video arrays cannot be serialized.
+            # Deferred image/video stays on the original prompt for the orchestrator;
+            # keep it off the wire, where PIL images and video arrays cannot be serialized.
             wire_payload.pop("deferred_multi_modal_data", None)
         if isinstance(raw_buffer, dict):
             model_intermediate_buffer = raw_buffer

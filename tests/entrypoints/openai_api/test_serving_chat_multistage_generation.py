@@ -199,16 +199,7 @@ def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):
 def test_joyai_asr_profile_bypasses_asr_without_audio(serving_chat):
     from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
 
-    serving_chat.engine_client = SimpleNamespace(
-        stage_configs=[
-            SimpleNamespace(
-                model_stage=stage.model_stage,
-                requires_multimodal_data=stage.requires_multimodal_data,
-                bypass_without_modalities=stage.bypass_without_modalities,
-            )
-            for stage in JOYAI_VL_INTERACTION_ASR_PIPELINE.stages
-        ]
-    )
+    serving_chat.engine_client = SimpleNamespace(stage_configs=list(JOYAI_VL_INTERACTION_ASR_PIPELINE.stages))
     image = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}
     audio = {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}}
 
