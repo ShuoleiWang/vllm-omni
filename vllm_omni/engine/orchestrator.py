@@ -2049,6 +2049,7 @@ class OrchestratorBase:
         stage_id: int,
         prompt: Any,
         req_state: OrchestratorRequestState,
+        lora_request: Any = None,
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
@@ -2060,6 +2061,7 @@ class OrchestratorBase:
             params=req_state.sampling_params_list[stage_id],
             supported_tasks=("generate",),
             arrival_time=req_state.request_timestamp,
+            lora_request=lora_request,
         )
         request = self._upgrade_processed_stage_request(request, prompt)
         request.external_req_id = req_id
@@ -3091,7 +3093,9 @@ class Orchestrator(OrchestratorBase):
         if stage_id != 0:
             _t_preprocess = _time.perf_counter()
             try:
-                prompt = self._build_entry_stage_request(request_id, stage_id, prompt, req_state)
+                prompt = self._build_entry_stage_request(
+                    request_id, stage_id, prompt, req_state, lora_request=msg.lora_request
+                )
             except StageUnavailableError:
                 await self._fail_request_dead_stage(request_id, stage_id)
                 return

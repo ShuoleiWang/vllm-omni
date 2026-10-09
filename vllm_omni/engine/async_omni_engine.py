@@ -371,6 +371,7 @@ class AsyncOmniEngine(OmniEngineBase):
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
             entry_stage_id=entry_stage_id,
+            lora_request=lora_request,
         )
 
     def _build_cfg_companions(

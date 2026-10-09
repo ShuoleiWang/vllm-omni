@@ -15,6 +15,7 @@ from typing import Any
 
 import janus
 import pytest
+from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
@@ -522,6 +523,7 @@ async def _enqueue_add_request(
     final_stage_id: int,
     final_output_stage_ids: list[int] | None = None,
     entry_stage_id: int = 0,
+    lora_request: LoRARequest | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -537,6 +539,7 @@ async def _enqueue_add_request(
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
             entry_stage_id=entry_stage_id,
+            lora_request=lora_request,
         )
     )
 
@@ -633,7 +636,8 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
 @pytest.mark.asyncio
 async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
     """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
-    (the one that also prepares prompts forwarded to it) and never reaches stage 0."""
+    (the one that also prepares prompts forwarded to it) with the request's LoRA, and
+    never reaches stage 0."""
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)
     processors = [
@@ -642,10 +646,11 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
     ]
     orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
     raw_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    lora = LoRARequest("adapter", 1, "/adapters/adapter")
     processed_prompts: list[Any] = []
 
     def process_inputs(*, request_id, prompt, params, **kwargs):
-        processed_prompts.append(prompt)
+        processed_prompts.append((prompt, kwargs.get("lora_request")))
         return _processed_request(request_id, params)
 
     orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
@@ -659,10 +664,11 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
             entry_stage_id=1,
+            lora_request=lora,
         )
 
         await _wait_for(lambda: len(stage1.add_request_calls) == 1)
-        assert processed_prompts == [raw_prompt]
+        assert processed_prompts == [(raw_prompt, lora)]
         assert stage1.add_request_calls[0][0].prompt_token_ids == [4, 5, 6]
         stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 1.0))
 
