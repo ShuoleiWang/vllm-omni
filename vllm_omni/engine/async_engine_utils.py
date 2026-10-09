@@ -45,24 +45,16 @@ def scope_stage_replica_mm_uuids(
     replica_id: int,
     model_id: str,
     mm_hasher_algorithm: str,
-) -> None:
-    """Make multimodal processor-cache keys local to a stage replica.
-
-    A stage's multimodal sender cache lives in the one input processor that
-    feeds it, while each replica of that stage owns a separate EngineCore
-    receiver cache. If two requests with the same image are routed to
-    different replicas, a plain content hash can make the sender omit the
-    tensor for a replica that has never received it. Prefixing user/content
-    UUIDs with the selected replica keeps cache reuse within the receiver that
-    owns it.
-    """
+) -> Any:
+    """Return ``prompt`` with its multimodal cache UUIDs scoped to one stage replica, as a
+    shallow copy (see ``AsyncOmniEngine._ensure_stage_replica_mm_uuids``)."""
 
     if not isinstance(prompt, dict):
-        return
+        return prompt
 
     mm_data = prompt.get("multi_modal_data")
     if not isinstance(mm_data, dict) or not mm_data:
-        return
+        return prompt
 
     from vllm.multimodal.hasher import MultiModalHasher
 
@@ -101,8 +93,11 @@ def scope_stage_replica_mm_uuids(
 
         scoped_uuids[modality] = modality_uuids
 
-    if scoped_uuids:
-        prompt["multi_modal_uuids"] = scoped_uuids
+    if not scoped_uuids:
+        return prompt
+    scoped_prompt = dict(prompt)
+    scoped_prompt["multi_modal_uuids"] = scoped_uuids
+    return scoped_prompt
 
 
 _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"

@@ -2015,14 +2015,15 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
-    def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> None:
-        """Bind the receiving replica before multimodal processing and scope the cache keys to it."""
+    def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> Any:
+        """Bind the receiving replica before multimodal processing and return the prompt with
+        its cache keys scoped to it."""
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
-            return
+            return prompt
         pool = self.stage_pools[stage_id]
         if pool.live_num_replicas <= 1:
-            return
+            return prompt
         replica_id = pool.preselect_replica_id(req_id)
         if replica_id is None:
             # No serviceable replica yet (distributed mode): unscoped keys could let the
@@ -2030,7 +2031,7 @@ class OrchestratorBase:
             raise StageUnavailableError(f"stage {stage_id} has no serviceable replica to bind")
         model_config = getattr(pool.stage_vllm_config, "model_config", None)
         mm_config = getattr(model_config, "multimodal_config", None)
-        for item in prompts:
+        scoped = [
             scope_stage_replica_mm_uuids(
                 item,
                 stage_id=stage_id,
@@ -2038,6 +2039,9 @@ class OrchestratorBase:
                 model_id=str(getattr(model_config, "model", "")),
                 mm_hasher_algorithm=getattr(mm_config, "mm_hasher_algorithm", None) or "blake3",
             )
+            for item in prompts
+        ]
+        return scoped if isinstance(prompt, list) else scoped[0]
 
     def _build_entry_stage_request(
         self,
@@ -2048,7 +2052,7 @@ class OrchestratorBase:
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
-        self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
+        prompt = self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
         processor = self._get_stage_input_processor(stage_id)
         request = processor.process_inputs(
             request_id=req_id,
@@ -2089,7 +2093,7 @@ class OrchestratorBase:
             request.payload_sender_info = payload_sender_info
             return request
 
-        self._scope_stage_mm_cache_to_replica(req_id, next_stage_id, next_input)
+        next_input = self._scope_stage_mm_cache_to_replica(req_id, next_stage_id, next_input)
         processor = self._get_stage_input_processor(next_stage_id)
         # A pooling stage is driven by PoolingParams; vLLM validates them against
         # the stage's supported tasks, so advertise the model's pooling tasks (or

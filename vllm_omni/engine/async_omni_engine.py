@@ -81,8 +81,28 @@ class AsyncOmniEngine(OmniEngineBase):
 
         return getattr(mm_config, "mm_hasher_algorithm", None) or self._DEFAULT_MM_HASHER_ALGORITHM
 
-    def _ensure_stage_replica_mm_uuids(self, prompt: Any, *, stage_id: int, replica_id: int) -> None:
-        scope_stage_replica_mm_uuids(
+    def _ensure_stage_replica_mm_uuids(
+        self,
+        prompt: Any,
+        *,
+        stage_id: int,
+        replica_id: int,
+    ) -> Any:
+        """Make multimodal processor-cache keys local to a stage replica.
+
+        vLLM's frontend multimodal sender cache is process-global, while each
+        vllm-omni stage replica owns a separate EngineCore receiver cache. If
+        two requests with the same image are routed to different stage-0
+        replicas, a plain content hash can make the sender omit the tensor for
+        a replica that has never received it. Prefixing user/content UUIDs with
+        the selected replica keeps cache reuse within the receiver that owns it.
+
+        Returns a shallow copy carrying the scoped UUIDs; the caller's prompt is
+        left untouched. Writing the scoped UUIDs back would make the next
+        request built from that dict reuse them as user UUIDs and key its new
+        media under the old media's hash.
+        """
+        return scope_stage_replica_mm_uuids(
             prompt,
             stage_id=stage_id,
             replica_id=replica_id,
@@ -130,20 +150,25 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         request_id: str,
         prompt: Any,
-    ) -> int | None:
+    ) -> tuple[int | None, Any]:
+        """Return the preselected stage-0 replica and the prompt to process.
+
+        The returned prompt is a scoped copy when scoping applies, else
+        ``prompt`` itself.
+        """
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
-            return None
+            return None, prompt
 
         stage0_pool = stage_pools[0]
         # TODO: Currently only supports the ar -> dit process.
         # Future scenarios (e.g., dit -> ar) need to be added, which will require modifications here.
         if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
-            return None
+            return None, prompt
 
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
-            return None
+            return None, prompt
 
         if self._stage_pool_is_distributed(stage0_pool):
             preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
@@ -153,7 +178,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     "without preselect support req=%s",
                     request_id,
                 )
-                return None
+                return None, prompt
             replica_id = preselect_replica_id(request_id)
             if replica_id is None:
                 logger.debug(
@@ -161,23 +186,18 @@ class AsyncOmniEngine(OmniEngineBase):
                     "because no serviceable replica is available yet req=%s",
                     request_id,
                 )
-                return None
+                return None, prompt
         else:
             replica_id = stage0_pool.select_replica_id(request_id)
 
-        for p in prompts:
-            self._ensure_stage_replica_mm_uuids(
-                p,
-                stage_id=0,
-                replica_id=replica_id,
-            )
+        scoped = [self._ensure_stage_replica_mm_uuids(p, stage_id=0, replica_id=replica_id) for p in prompts]
 
         logger.debug(
             "[AsyncOmniEngine] Scoped multimodal cache keys to stage-0 replica-%s for req=%s",
             replica_id,
             request_id,
         )
-        return replica_id
+        return replica_id, (scoped if isinstance(prompt, list) else scoped[0])
 
     def _build_add_request_message(
         self,
@@ -270,7 +290,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 for item in prompt:
                     inject_global_id(item, request_id)
 
-            preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
+            preselected_stage0_replica, prompt = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
             )
