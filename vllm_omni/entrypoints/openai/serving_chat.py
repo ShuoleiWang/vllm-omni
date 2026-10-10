@@ -625,7 +625,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # A request that bypasses stage 0 is rendered with the tokenizer and
             # chat template of the stage it enters at.
-            entry_stage_id = self._resolve_entry_stage_id(request.messages)
+            entry_stage_id = self.engine_client.resolve_entry_stage_id(self._input_modalities(request.messages))
             renderer = self.engine_client.get_stage_renderer(entry_stage_id) if entry_stage_id else self.renderer
             tokenizer = renderer.get_tokenizer()
             if tokenizer is None:
@@ -1108,20 +1108,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["additional_information"] = additional_information
         return additional_information
 
-    def _resolve_entry_stage_id(self, messages: list[ChatCompletionMessageParam]) -> int:
-        """Return 1 when stage 0 declares ``bypass_without_modalities`` and the
-        request carries none of them (it bypasses stage 0), else 0."""
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
-        bypass_without = set(getattr(stage_configs[0], "bypass_without_modalities", ())) if stage_configs else set()
-        if not bypass_without:
-            return 0
-        carried = {
-            self._deferred_multimodal_part(part, bypass_without)[0]
+    def _input_modalities(self, messages: list[ChatCompletionMessageParam]) -> set[str]:
+        """Return the modalities of the media parts in ``messages``."""
+        return {
+            modality
             for message in messages
             if isinstance(message, dict) and isinstance(message.get("content"), list)
             for part in message["content"]
+            if (modality := self._deferred_multimodal_part(part, {"audio", "image", "video"})[0])
         }
-        return 0 if carried & bypass_without else 1
 
     @staticmethod
     async def _render_chat_deferred(
