@@ -635,6 +635,31 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
     )
 
 
+def _input_processing_orchestrator(stage_clients, *, stage_vllm_configs=None) -> Orchestrator:
+    return Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=_build_stage_pools(stage_clients, stage_vllm_configs=stage_vllm_configs),
+    )
+
+
+def _entry_submission(request_id: str, prompt: Any) -> StageSubmissionMessage:
+    return StageSubmissionMessage(
+        type="add_request",
+        request_id=request_id,
+        prompt=prompt,
+        original_prompt=prompt,
+        output_prompt_text=None,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        entry_stage_id=1,
+        preprocess_ms=0.0,
+        request_timestamp=time.time(),
+        enqueue_ts=0.0,
+    )
+
+
 @pytest.mark.asyncio
 async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
     """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
@@ -717,7 +742,16 @@ def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [
         StagePool(0, [FakeStageClient()]),
-        StagePool(1, [FakeStageClient(final_output=True), FakeStageClient(final_output=True)]),
+        StagePool(
+            1,
+            [FakeStageClient(final_output=True), FakeStageClient(final_output=True)],
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64,
+                    multimodal_config=SimpleNamespace(mm_processor_cache_gb=1, mm_hasher_algorithm="blake3"),
+                )
+            ),
+        ),
     ]
     seen_uuids: dict[str, str] = {}
 
@@ -729,11 +763,13 @@ def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     req_state = SimpleNamespace(
         sampling_params_list=[_sampling_params(), _sampling_params()], request_timestamp=0.0, final_stage_id=1
     )
-    orchestrator._build_entry_stage_request(
-        "req-bypass", 1, {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}, req_state
-    )
+    bypass_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    forwarded_prompt = {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}
+    replica_id = orchestrator._preselect_stage_mm_cache_replica("req-bypass", 1, bypass_prompt)
+    orchestrator._build_entry_stage_request("req-bypass", 1, bypass_prompt, req_state, scoped_replica_id=replica_id)
+    replica_id = orchestrator._preselect_stage_mm_cache_replica("req-forwarded", 1, forwarded_prompt)
     orchestrator._build_next_stage_request(
-        "req-forwarded", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
+        "req-forwarded", 1, forwarded_prompt, _sampling_params(), scoped_replica_id=replica_id
     )
 
     stage1_pool = orchestrator.stage_pools[1]
@@ -745,10 +781,218 @@ def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     # A distributed pool whose snapshot has no UP replica yet cannot bind one.
     stage1_pool.preselect_replica_id = lambda req_id: None
     with pytest.raises(StageUnavailableError):
-        orchestrator._build_next_stage_request(
-            "req-unbound", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
-        )
+        orchestrator._preselect_stage_mm_cache_replica("req-unbound", 1, forwarded_prompt)
     assert "req-unbound" not in seen_uuids
+
+
+@pytest.mark.parametrize(
+    ("cache_gb", "replicas", "media"),
+    [(0, 2, {"image": ["frame"]}), (1, 1, {"image": ["frame"]}), (1, 2, {}), (1, 2, {"image": []})],
+)
+def test_stage_mm_cache_scoping_skips_unneeded_binding(cache_gb, replicas, media, mocker) -> None:
+    orchestrator = object.__new__(Orchestrator)
+    preselect = mocker.Mock(side_effect=AssertionError("unnecessary replica binding"))
+    orchestrator.stage_pools = [
+        SimpleNamespace(
+            live_num_replicas=replicas,
+            preselect_replica_id=preselect,
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_processor_cache_gb=cache_gb))
+            ),
+        )
+    ]
+    assert orchestrator._preselect_stage_mm_cache_replica("req", 0, {"multi_modal_data": media}) is None
+    preselect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bypass_preprocessing_keeps_stage_outputs_responsive(monkeypatch) -> None:
+    stage0 = FakeStageClient(final_output=True)
+    stage1 = FakeStageClient(final_output=True)
+    orchestrator = _input_processing_orchestrator([[stage0], [stage1]])
+    started, release = threading.Event(), threading.Event()
+    worker_threads = []
+
+    def make_processor(_config):
+        worker_threads.append(threading.get_ident())
+
+        def process_inputs(*, request_id, params, **_kwargs):
+            worker_threads.append(threading.get_ident())
+            started.set()
+            assert release.wait(2)
+            return _processed_request(request_id, params)
+
+        return SimpleNamespace(process_inputs=process_inputs)
+
+    monkeypatch.setattr("vllm_omni.engine.stage_init_utils.build_stage0_input_processor", make_processor)
+    other = OrchestratorRequestState(request_id="other", final_stage_id=0)
+    orchestrator.request_states[other.request_id] = other
+    submission = asyncio.create_task(orchestrator._handle_add_request(_entry_submission("slow", {"prompt": "video"})))
+    try:
+        await _wait_for(started.is_set)
+        assert not submission.done()
+        await asyncio.wait_for(
+            orchestrator._route_output(0, 0, _build_request_output("other"), other, stage_metrics=None), timeout=0.5
+        )
+        assert orchestrator.output_async_queue.get_nowait().request_id == "other"
+        assert not release.is_set()
+        assert all(thread_id != threading.get_ident() for thread_id in worker_threads)
+    finally:
+        release.set()
+        await submission
+
+
+@pytest.mark.asyncio
+async def test_bypass_and_forwarded_processing_wait_for_prior_submit(monkeypatch) -> None:
+    next_input = {"prompt": "same image", "multi_modal_data": {"image": ["frame"]}}
+    stage1 = FakeStageClient(final_output=True, next_inputs=[next_input])
+    orchestrator = _input_processing_orchestrator([[FakeStageClient()], [stage1]])
+    processed, delivered = [], []
+
+    def process_inputs(*, request_id, params, **_kwargs):
+        if processed:
+            assert delivered == ["bypass"]
+        processed.append(request_id)
+        return _processed_request(request_id, params)
+
+    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    pool = orchestrator.stage_pools[1]
+    submit = pool.submit_initial
+    entered_submit, release_submit = asyncio.Event(), asyncio.Event()
+
+    async def delay_submit(request_id, *args, **kwargs):
+        if request_id == "bypass":
+            entered_submit.set()
+            await release_submit.wait()
+        delivered.append(request_id)
+        return await submit(request_id, *args, **kwargs)
+
+    monkeypatch.setattr(pool, "submit_initial", delay_submit)
+    forwarded = OrchestratorRequestState(
+        request_id="forwarded", sampling_params_list=[_sampling_params(), _sampling_params()], final_stage_id=1
+    )
+    orchestrator.request_states[forwarded.request_id] = forwarded
+    first = asyncio.create_task(orchestrator._handle_add_request(_entry_submission("bypass", next_input)))
+    second = None
+    try:
+        await asyncio.wait_for(entered_submit.wait(), timeout=2)
+        second = asyncio.create_task(
+            orchestrator._forward_to_next_stage("forwarded", 0, _build_request_output("forwarded"), forwarded)
+        )
+        await asyncio.sleep(0)
+        assert processed == ["bypass"]
+        assert not second.done()
+    finally:
+        release_submit.set()
+        await first
+        if second is not None:
+            await second
+    assert processed == delivered == ["bypass", "forwarded"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True], ids=["aborted", "cancelled"])
+async def test_aborted_preprocessing_cannot_seed_an_unsent_cache_hit(cancel) -> None:
+    stage1 = FakeStageClient(final_output=True)
+    orchestrator = _input_processing_orchestrator([[FakeStageClient()], [stage1]])
+    started, release = threading.Event(), threading.Event()
+    cached, processed = set(), []
+
+    def process_inputs(*, request_id, params, **_kwargs):
+        assert not cached, "an unsent reference must not become a sender-cache hit"
+        cached.add("image")
+        processed.append(request_id)
+        if request_id == "aborted":
+            started.set()
+            assert release.wait(2)
+        return _processed_request(request_id, params)
+
+    orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=process_inputs, renderer=SimpleNamespace(clear_mm_cache=cached.clear)
+    )
+    first = asyncio.create_task(orchestrator._handle_add_request(_entry_submission("aborted", {"prompt": "image"})))
+    second = None
+    try:
+        await _wait_for(started.is_set)
+        if cancel:
+            first.cancel()
+            await asyncio.sleep(0)
+            assert not first.done()
+        await orchestrator._cleanup_request_ids(["aborted"], abort=True)
+        second = asyncio.create_task(orchestrator._handle_add_request(_entry_submission("next", {"prompt": "image"})))
+        await asyncio.sleep(0)
+        assert processed == ["aborted"]
+    finally:
+        release.set()
+        results = await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)
+    if cancel:
+        assert isinstance(results[0], asyncio.CancelledError)
+    else:
+        assert results[0] is None
+    assert results[1] is None
+    assert processed == ["aborted", "next"]
+    assert [args[0].request_id for args in stage1.add_request_calls] == ["next"]
+    assert "aborted" not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_stage_id", [0, 1])
+async def test_cleanup_during_entry_submit_does_not_prewarm_orphaned_request(entry_stage_id, mocker) -> None:
+    orchestrator = _input_processing_orchestrator([[FakeStageClient()] for _ in range(3)])
+    orchestrator.async_chunk = True
+    orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **_kwargs: _processed_request(request_id, params)
+    )
+
+    async def submit_and_cleanup(request_id, *_args, **_kwargs):
+        await orchestrator._cleanup_request_ids([request_id], abort=True)
+        return 0
+
+    mocker.patch.object(orchestrator.stage_pools[entry_stage_id], "submit_initial", side_effect=submit_and_cleanup)
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", new_callable=mocker.AsyncMock)
+    submission = _entry_submission("aborted", {"prompt": "image"})
+    submission.entry_stage_id = entry_stage_id
+    submission.final_stage_id = 2
+    submission.sampling_params_list.append(_sampling_params())
+
+    await orchestrator._handle_add_request(submission)
+
+    prewarm.assert_not_awaited()
+    assert "aborted" not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_abort_while_waiting_for_processor_does_not_recreate_replica_binding(mocker) -> None:
+    orchestrator = _input_processing_orchestrator(
+        [[FakeStageClient()], [FakeStageClient(final_output=True), FakeStageClient(final_output=True)]],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64, multimodal_config=SimpleNamespace(mm_processor_cache_gb=1)
+                )
+            ),
+        ],
+    )
+    pool = orchestrator.stage_pools[1]
+    processor = mocker.Mock(side_effect=lambda *, request_id, params, **_kwargs: _processed_request(request_id, params))
+    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=processor)
+    select = mocker.spy(orchestrator, "_preselect_stage_mm_cache_replica")
+
+    async with orchestrator._stage_input_processing(1) as mark_submitted:
+        submission = asyncio.create_task(
+            orchestrator._handle_add_request(
+                _entry_submission("aborted", {"prompt": "image", "multi_modal_data": {"image": ["frame"]}})
+            )
+        )
+        await _wait_for(lambda: "aborted" in orchestrator.request_states)
+        await orchestrator._cleanup_request_ids(["aborted"], abort=True)
+        mark_submitted()
+    await submission
+
+    select.assert_not_called()
+    processor.assert_not_called()
+    assert pool.get_bound_replica_id("aborted") is None
 
 
 @pytest.mark.asyncio

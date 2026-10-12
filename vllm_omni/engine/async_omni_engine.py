@@ -199,6 +199,12 @@ class AsyncOmniEngine(OmniEngineBase):
         )
         return replica_id, (scoped if isinstance(prompt, list) else scoped[0])
 
+    def _stage0_uses_mm_processor_cache(self) -> bool:
+        configs = getattr(self, "stage_vllm_configs", None) or []
+        model_config = getattr(configs[0], "model_config", None) if configs else None
+        mm_config = getattr(model_config, "multimodal_config", None)
+        return bool(mm_config is not None and getattr(mm_config, "mm_processor_cache_gb", 0) > 0)
+
     def _build_add_request_message(
         self,
         request_id: str,
@@ -372,6 +378,7 @@ class AsyncOmniEngine(OmniEngineBase):
             request_artifact_dirs=request_artifact_dirs or None,
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
+            scoped_replica_id=preselected_stage0_replica if self._stage0_uses_mm_processor_cache() else None,
         )
 
     def _build_cfg_companions(

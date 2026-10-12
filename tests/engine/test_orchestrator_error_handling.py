@@ -53,6 +53,7 @@ from .test_orchestrator import (
     _build_stage_pools,
     _engine_core_outputs,
     _enqueue_add_request,
+    _entry_submission,
     _get_output_message,
     _wait_for,
 )
@@ -1144,6 +1145,33 @@ async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> Non
             q.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, VLLMValidationError, AttributeError, TypeError])
+async def test_bypass_input_validation_is_distinct_from_processor_bugs(error_type) -> None:
+    stage1 = FakeStageClient(final_output=True)
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [stage1]]))
+
+    def process_inputs(**_kwargs):
+        raise error_type("processor failure")
+
+    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    try:
+        submission = _entry_submission("rejected", {"prompt": "image"})
+        if error_type in (AttributeError, TypeError):
+            with pytest.raises(error_type, match="processor failure"):
+                await orchestrator._handle_add_request(submission)
+            assert queues[1].async_q.empty()
+        else:
+            await orchestrator._handle_add_request(submission)
+            error = queues[1].async_q.get_nowait()
+            assert (error.status_code, error.fatal) == (400, False)
+            assert "rejected" not in orchestrator.request_states
+        assert stage1.add_request_calls == []
+    finally:
+        for q in queues:
+            q.close()
+
+
 # ``test_duplex_input_processor_failure_is_request_scoped`` lived here upstream,
 # where one Orchestrator served both turn-based and duplex requests. Duplex
 # request ownership now belongs to DuplexOrchestrator, and the base
@@ -1380,5 +1408,37 @@ async def test_downstream_sender_clear_failure_is_nonfatal(failure):
         await orchestrator._handle_collective_rpc(message)
         assert queues[2].async_q.get_nowait().results == [None]
     finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_control_rpc_waits_for_processing_and_submission_guard() -> None:
+    pools = _build_stage_pools([[FakeStageClient()]])
+    orchestrator, queues = _build_bare_orchestrator(pools)
+    renderer = SimpleNamespace(clear_mm_cache_async=AsyncMock())
+    orchestrator._stage_input_processors[0] = SimpleNamespace(renderer=renderer)
+    pools[0].collective_rpc = AsyncMock(return_value=True)
+    reset = None
+    try:
+        async with orchestrator._stage_input_processing(0) as mark_submitted:
+            reset = asyncio.create_task(
+                orchestrator._handle_collective_rpc(
+                    CollectiveRPCRequestMessage(
+                        rpc_id="reset", method="reset_mm_cache", args=(), kwargs={}, stage_ids=[0]
+                    )
+                )
+            )
+            await asyncio.sleep(0)
+            renderer.clear_mm_cache_async.assert_not_awaited()
+            pools[0].collective_rpc.assert_not_awaited()
+            mark_submitted()
+        await reset
+        renderer.clear_mm_cache_async.assert_awaited_once()
+        pools[0].collective_rpc.assert_awaited_once()
+    finally:
+        if reset is not None and not reset.done():
+            reset.cancel()
+            await asyncio.gather(reset, return_exceptions=True)
         for q in queues:
             q.close()

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -446,6 +448,23 @@ def test_mm_uuid_scoping_leaves_caller_prompt_untouched(mocker: MockerFixture):
     assert prompt["multi_modal_uuids"] == {"image": ["user-uuid"]}
 
 
+@pytest.mark.parametrize("cache_gb", [0, 1])
+def test_scoped_replica_metadata_only_pins_enabled_mm_cache(mocker: MockerFixture, cache_gb):
+    engine, _ = _two_replica_engine_recording_uuids(mocker)
+    engine.stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_processor_cache_gb=cache_gb)))
+    ]
+
+    message = engine._build_add_request_message(
+        request_id="req-cache",
+        prompt={"prompt": "describe", "multi_modal_data": {"image": "image-a"}},
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+        final_stage_id=0,
+    )
+
+    assert message.scoped_replica_id == (0 if cache_gb else None)
+
+
 def test_mm_uuid_scoping_keys_reused_prompt_by_its_own_media(mocker: MockerFixture):
     # Callers may build each request from a dict that already went through the
     # engine. Every request must still be keyed by its own media, otherwise the
@@ -479,6 +498,9 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
+    engine.stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_processor_cache_gb=1)))
+    ]
 
     addr0 = "tcp://host-a:1000/input"
     addr1 = "tcp://host-b:1000/input"
@@ -498,15 +520,18 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     input_processor.process_inputs.side_effect = process_inputs
     engine.input_processor = input_processor
 
+    messages = []
     for request_id in ("req-1", "req-2"):
-        engine._build_add_request_message(
-            request_id=request_id,
-            prompt={
-                "prompt": "describe",
-                "multi_modal_data": {"image": "same-image"},
-            },
-            sampling_params_list=[params],
-            final_stage_id=0,
+        messages.append(
+            engine._build_add_request_message(
+                request_id=request_id,
+                prompt={
+                    "prompt": "describe",
+                    "multi_modal_data": {"image": "same-image"},
+                },
+                sampling_params_list=[params],
+                final_stage_id=0,
+            )
         )
 
     assert seen_uuids[0].startswith("stage0:rep0:")
@@ -515,13 +540,17 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert stage_pool.get_bound_replica_id("req-2") == 1
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
+    assert [message.scoped_replica_id for message in messages] == [0, 1]
 
     # Replica 0 leaves the hub after req-1's keys were scoped to it: submit fails
     # the request instead of sending those keys to replica 1.
     stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
     with pytest.raises(StageUnavailableError):
         await stage_pool.submit_initial(
-            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request()
+            "req-1",
+            mocker.Mock(sampling_params_list=[params]),
+            _make_engine_core_request(),
+            expected_scoped_replica_id=messages[0].scoped_replica_id,
         )
     assert stage_pool.get_bound_replica_id("req-1") is None
 

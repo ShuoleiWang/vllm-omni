@@ -34,6 +34,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_artifact_dirs: list[str] | None = None
     entry_stage_id: int = 0
     lora_request: LoRARequest | None = None
+    scoped_replica_id: int | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

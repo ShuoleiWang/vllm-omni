@@ -193,6 +193,8 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         final_stage_id=1,
     )
 
+    orchestrator.request_states[req_state.request_id] = req_state
+
     await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 
     assert input_processor.calls

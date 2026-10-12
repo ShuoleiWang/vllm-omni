@@ -57,6 +57,7 @@ class _FakePool:
             model_config=SimpleNamespace(max_model_len=64, stage_connector_config={"extra": {"role": role}})
         )
         self.submitted: list[Any] = []
+        self.updated: list[Any] = []
 
     def live_replica_ids(self) -> list[int]:
         return [0]
@@ -66,6 +67,7 @@ class _FakePool:
         return 0
 
     async def submit_update(self, request_id, _req_state, request, prompt_text=None):
+        self.updated.append(request)
         return 0
 
     def get_bound_replica_id(self, request_id):
@@ -96,7 +98,7 @@ def _prompt(waveform: torch.Tensor | None) -> dict[str, Any]:
     return prompt
 
 
-def _stage0(**kwargs: Any) -> SimpleNamespace:
+def _entry_request(**kwargs: Any) -> SimpleNamespace:
     return SimpleNamespace(prompt_token_ids=list(_TOKENS), **kwargs)
 
 
@@ -104,15 +106,16 @@ def _sampling_params() -> list[SamplingParams]:
     return [SamplingParams(max_tokens=1) for _ in range(3)]
 
 
-def _message(msg_type: str, original_prompt: Any) -> StageSubmissionMessage:
+def _message(msg_type: str, original_prompt: Any, *, entry_stage_id: int = 0) -> StageSubmissionMessage:
     return StageSubmissionMessage(
         type=msg_type,
         request_id="req",
-        prompt=_stage0(resumable=False),
+        prompt=_entry_request(resumable=False),
         original_prompt=original_prompt,
         output_prompt_text=None,
         sampling_params_list=_sampling_params(),
         final_stage_id=2,
+        entry_stage_id=entry_stage_id,
         preprocess_ms=0.0,
         request_timestamp=time.time(),
         enqueue_ts=0.0,
@@ -168,20 +171,23 @@ def test_attach_leaves_input_untouched(make_client: Any, mocker) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entry_stage_id", [0, 1])
 @pytest.mark.parametrize(
     ("case", "expected_calls"),
     [
         pytest.param({"attach": False}, 0, id="flag-off"),
         pytest.param({"session_owned": True}, 0, id="session-owned"),
-        pytest.param({"stage0": {"resumable": True}}, 0, id="resumable-request"),
+        pytest.param({"entry": {"resumable": True}}, 0, id="resumable-request"),
         # Without an explicit flag the request inherits streaming input.
-        pytest.param({"stage0": {}, "streaming": True}, 0, id="streaming-input"),
+        pytest.param({"entry": {}, "streaming": True}, 0, id="streaming-input"),
         pytest.param({"waveform": None}, 1, id="no-reference-audio"),
         pytest.param({"raises": True}, 1, id="payload-func-raises"),
         pytest.param({"no_func": True}, 0, id="client-without-func"),
     ],
 )
-async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_calls: int, mocker) -> None:
+async def test_prewarm_submits_plain_placeholder(
+    case: dict[str, Any], expected_calls: int, entry_stage_id: int, mocker
+) -> None:
     if case.get("raises"):
         payload_func = mocker.Mock(side_effect=ValueError("bad reference"))
     else:
@@ -192,35 +198,70 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
         prompt=_prompt(case.get("waveform", _waveform())),
         sampling_params_list=_sampling_params(),
         final_stage_id=2,
+        entry_stage_id=entry_stage_id,
         session_owned=case.get("session_owned", False),
     )
     streaming = case.get("streaming", False)
     req_state.streaming.enabled = streaming
-    stage0_kwargs = case.get("stage0", {"resumable": False})
+    entry_kwargs = case.get("entry", {"resumable": False})
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
-        "req", _stage0(**stage0_kwargs), req_state, attach_prewarm_payload=case.get("attach", True)
+        "req", _entry_request(**entry_kwargs), req_state, attach_prewarm_payload=case.get("attach", True)
     )
 
     assert prewarmed is True
     assert payload_func.call_count == expected_calls
     (placeholder,) = orchestrator.stage_pools[2].submitted
     assert _entry_keys(placeholder) == _PLAIN_KEYS
-    assert placeholder.resumable is stage0_kwargs.get("resumable", streaming)
+    assert placeholder.resumable is entry_kwargs.get("resumable", streaming)
+    assert all(not pool.submitted for pool in orchestrator.stage_pools[: entry_stage_id + 1])
 
 
 @pytest.mark.asyncio
-async def test_add_request_attaches_payload_once_and_streaming_update_does_not(mocker) -> None:
+@pytest.mark.parametrize("entry_stage_id", [0, 1, 2])
+async def test_prewarm_at_final_entry_stage_submits_nothing(entry_stage_id: int, mocker) -> None:
+    payload_func = mocker.Mock(wraps=code2wav_prewarm_payload)
+    orchestrator = _orchestrator(payload_func)
+    req_state = OrchestratorRequestState(
+        request_id="req",
+        prompt=_prompt(_waveform()),
+        sampling_params_list=_sampling_params(),
+        final_stage_id=entry_stage_id,
+        entry_stage_id=entry_stage_id,
+    )
+
+    # No downstream stage needs a placeholder, so token IDs are not required.
+    prewarmed = await orchestrator._prewarm_async_chunk_stages(
+        "req", SimpleNamespace(), req_state, attach_prewarm_payload=True
+    )
+
+    assert prewarmed is True
+    payload_func.assert_not_called()
+    assert all(not pool.submitted for pool in orchestrator.stage_pools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_stage_id", [0, 1])
+async def test_add_request_attaches_payload_once_and_streaming_update_does_not(entry_stage_id: int, mocker) -> None:
     waveform = _waveform()
     payload_func = mocker.Mock(wraps=code2wav_prewarm_payload)
     orchestrator = _orchestrator(payload_func)
     _, talker, code2wav = orchestrator.stage_pools
     prompt = _prompt(waveform)
+    message = _message("add_request", prompt, entry_stage_id=entry_stage_id)
+    if entry_stage_id:
+        # Isolate prewarming from the bypass entry's multimodal processor.
+        mocker.patch.object(orchestrator, "_build_entry_stage_request", return_value=message.prompt)
 
-    await orchestrator._handle_add_request(_message("add_request", prompt))
+    await orchestrator._handle_add_request(message)
 
-    # Only Code2Wav declares a payload func; the Talker placeholder stays plain.
-    assert _entry_keys(talker.submitted[0]) == _PLAIN_KEYS
+    assert orchestrator.request_states["req"].entry_stage_id == entry_stage_id
+    assert all(not pool.submitted for pool in orchestrator.stage_pools[:entry_stage_id])
+    if entry_stage_id == 0:
+        # Only Code2Wav declares a payload func; the Talker placeholder stays plain.
+        assert _entry_keys(talker.submitted[0]) == _PLAIN_KEYS
+    else:
+        assert talker.submitted == [message.prompt]
     (placeholder,) = code2wav.submitted
     assert _entry_keys(placeholder) == _PLAIN_KEYS | {_REF_KEY, _SR_KEY}
     prewarm = deserialize_additional_information(placeholder.additional_information)[ASYNC_CHUNK_PREWARM_NS]
@@ -234,9 +275,14 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
     assert prompt == _prompt(waveform)
 
     # The re-prewarm must not resend the payload to a stage that already holds
-    # the request, even though stage 0 is explicitly not resumable.
-    await orchestrator._handle_streaming_update(_message("streaming_update", {"prompt": "segment-2"}))
+    # the request, even though the entry request is explicitly not resumable.
+    # The update's default entry stage must not override the saved admission.
+    update = _message("streaming_update", {"prompt": "segment-2"})
+    await orchestrator._handle_streaming_update(update)
 
+    assert orchestrator.stage_pools[entry_stage_id].updated == [update.prompt]
+    assert all(not pool.updated for i, pool in enumerate(orchestrator.stage_pools) if i != entry_stage_id)
+    assert all(not pool.submitted for pool in orchestrator.stage_pools[:entry_stage_id])
     assert len(code2wav.submitted) == 2
     assert _entry_keys(code2wav.submitted[1]) == _PLAIN_KEYS
     assert payload_func.call_count == 1
