@@ -12,7 +12,6 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
-import asyncio
 import time as _time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -371,6 +370,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         return request
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+        if submission.resumable:
+            return await self._submit_stage_request(submission)
+        async with self._stage_input_submission(submission.context.stage_id):
+            return await self._submit_stage_request(submission)
+
+    async def _submit_stage_request(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
@@ -400,7 +405,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 resumable=False,
             )
             if self.request_states.get(context.request_id) is not request_state:
-                await asyncio.to_thread(self._forget_unsent_mm_items, context.stage_id, request)
                 raise RuntimeError("duplex request cancelled during input preprocessing")
         request.external_req_id = request.request_id
         mm_features = getattr(request, "mm_features", None)

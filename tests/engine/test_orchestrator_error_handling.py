@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 import janus
 import pytest
 from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -1112,7 +1113,7 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
 
 
 @pytest.mark.asyncio
-async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> None:
+async def test_forwarded_input_rejected_by_next_stage_is_request_scoped(mocker) -> None:
     """A forwarded prompt that fails the next stage's own validation (here more tokens
     than it accepts) fails only that request instead of escaping the orchestrator loop.
     One aborted while it is processed is not submitted, and the stage's sender cache
@@ -1132,7 +1133,9 @@ async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> Non
     sent: set[str] = set()
     orchestrator._stage_input_processors[1] = SimpleNamespace(
         process_inputs=process_inputs,
-        renderer=SimpleNamespace(mm_processor_cache=SimpleNamespace(invalidate=sent.discard)),
+        renderer=SimpleNamespace(
+            mm_processor_cache=mocker.Mock(spec=LruKeyReplicatedSenderCache, clear_cache=sent.clear)
+        ),
     )
     state = OrchestratorRequestState(
         request_id="too-long",

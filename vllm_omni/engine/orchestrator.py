@@ -19,7 +19,8 @@ import os
 import shutil
 import threading
 import time as _time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -29,6 +30,7 @@ import torch
 from vllm.config import ModelConfig
 from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -412,6 +414,7 @@ class OrchestratorBase:
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
         self._prompt_processing_lock = threading.RLock()
+        self._stage_input_submission_locks: dict[int, asyncio.Lock] = {}
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -2074,25 +2077,55 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
-    def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
-        # Input processors own mutable caches. Hold a thread lock even if the
-        # awaiting request is cancelled while its preprocessing is still running.
-        with self._prompt_processing_lock:
-            request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
-            if kwargs["request_id"] not in self.request_states:
-                # Cleaned up meanwhile: forget its media before the next request reads the cache.
-                self._forget_unsent_mm_items(stage_id, request)
-            return request
-
-    def _forget_unsent_mm_items(self, stage_id: int, request: Any) -> None:
-        """Drop the media of a processed request that will not be submitted from the stage's
-        sender cache, which recorded them as sent."""
-        processor = self._stage_input_processors.get(stage_id)
-        cache = processor.renderer.mm_processor_cache if processor is not None else None
-        if cache is not None:
+    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+        def process() -> Any:
             with self._prompt_processing_lock:
-                for feature in request.mm_features or ():
-                    cache.invalidate(feature.mm_hash or feature.identifier)
+                return self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+
+        worker = asyncio.create_task(asyncio.to_thread(process))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # The thread may still be waiting for the lock. Join the actual
+            # worker before the submission guard invalidates its cache writes.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not worker.cancelled():
+                worker.exception()
+            raise
+
+    def _clear_stage_input_cache(self, stage_id: int) -> None:
+        with self._prompt_processing_lock:
+            processor = self._stage_input_processors.get(stage_id)
+            cache = processor.renderer.mm_processor_cache if processor is not None else None
+            # Unsent accesses can change LRU eviction order, so drop the whole
+            # sender shadow. SHM allocations may still be read by earlier requests.
+            if isinstance(cache, LruKeyReplicatedSenderCache):
+                cache.clear_cache()
+
+    @asynccontextmanager
+    async def _stage_input_submission(self, stage_id: int) -> AsyncIterator[None]:
+        # The sender cache records media during preprocessing, before transport.
+        # Keep the next request out until this one has been sent or invalidated.
+        lock = self._stage_input_submission_locks.setdefault(stage_id, asyncio.Lock())
+        async with lock:
+            try:
+                yield
+            except BaseException:
+                # Finish cache rollback even if the caller is cancelled again.
+                cleanup = asyncio.create_task(asyncio.to_thread(self._clear_stage_input_cache, stage_id))
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
+                raise
 
     def _preselect_stage_mm_cache_replica(self, req_id: str, stage_id: int, prompt: Any) -> int | None:
         """Bind the receiving replica when the prompt's multimodal cache keys must name it: it
@@ -2142,8 +2175,7 @@ class OrchestratorBase:
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
         if replica_id is not None:
             prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
-        request = await asyncio.to_thread(
-            self._process_stage_inputs,
+        request = await self._process_stage_inputs(
             stage_id,
             request_id=req_id,
             prompt=prompt,
@@ -2197,8 +2229,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
-        request = await asyncio.to_thread(
-            self._process_stage_inputs,
+        request = await self._process_stage_inputs(
             next_stage_id,
             request_id=req_id,
             prompt=next_input,
@@ -2755,44 +2786,52 @@ class OrchestratorBase:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            try:
-                scoped_replica_id = (
-                    None
-                    if self._next_stage_input_is_tokens(next_input)
-                    else self._preselect_stage_mm_cache_replica(req_id, next_logical, next_input)
-                )
-                request = await self._build_next_stage_request(
-                    req_id,
-                    next_logical,
-                    next_input,
-                    params=params,
-                    mm_features=mm_features,
-                    resumable=next_stage_resumable,
-                    payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
-                    replica_id=scoped_replica_id,
-                )
-            except (ValueError, VLLMClientError) as exc:
-                # The forwarded input failed this stage's own validation (e.g. more
-                # visual tokens than it accepts), which stage 0 would have rejected
-                # at admission: fail only this request, as the bypass entry does.
-                logger.warning(
-                    "[Orchestrator] req=%s: stage-%s rejected the forwarded input: %s", req_id, next_logical, exc
-                )
-                await self._fail_request_client_error(
-                    req_id, next_logical, str(exc), release_owners=req_state.session_owned
-                )
-                return
-            if self.request_states.get(req_id) is not req_state:
-                # Cleaned up while its input was being processed.
-                await asyncio.to_thread(self._forget_unsent_mm_items, next_logical, request)
-                return
+            input_guard = (
+                nullcontext()
+                if self._next_stage_input_is_tokens(next_input)
+                else self._stage_input_submission(next_logical)
+            )
+            async with input_guard:
+                try:
+                    scoped_replica_id = (
+                        None
+                        if self._next_stage_input_is_tokens(next_input)
+                        else self._preselect_stage_mm_cache_replica(req_id, next_logical, next_input)
+                    )
+                    request = await self._build_next_stage_request(
+                        req_id,
+                        next_logical,
+                        next_input,
+                        params=params,
+                        mm_features=mm_features,
+                        resumable=next_stage_resumable,
+                        payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
+                        replica_id=scoped_replica_id,
+                    )
+                except (ValueError, VLLMClientError) as exc:
+                    if not self._next_stage_input_is_tokens(next_input):
+                        # Rendering may have cached media before validation or
+                        # request conversion failed, without returning mm_features.
+                        await asyncio.to_thread(self._clear_stage_input_cache, next_logical)
+                    # A forwarded input rejected by this stage fails only its request.
+                    logger.warning(
+                        "[Orchestrator] req=%s: stage-%s rejected the forwarded input: %s", req_id, next_logical, exc
+                    )
+                    await self._fail_request_client_error(
+                        req_id, next_logical, str(exc), release_owners=req_state.session_owned
+                    )
+                    return
+                if self.request_states.get(req_id) is not req_state:
+                    if not self._next_stage_input_is_tokens(next_input):
+                        await asyncio.to_thread(self._clear_stage_input_cache, next_logical)
+                    return
 
-            if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, request)
-            else:
-                replica_id = await next_pool.submit_initial(
-                    req_id, req_state, request, prompt_text=None, expected_replica_id=scoped_replica_id
-                )
+                if already_submitted:
+                    replica_id = await next_pool.submit_update(req_id, req_state, request)
+                else:
+                    replica_id = await next_pool.submit_initial(
+                        req_id, req_state, request, prompt_text=None, expected_replica_id=scoped_replica_id
+                    )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3229,47 +3268,50 @@ class Orchestrator(OrchestratorBase):
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
-        expected_replica_id = None
-        if stage_id != 0:
-            _t_preprocess = _time.perf_counter()
-            try:
-                expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
-                prompt = await self._build_entry_stage_request(
+        input_guard = self._stage_input_submission(stage_id) if stage_id != 0 else nullcontext()
+        async with input_guard:
+            expected_replica_id = None
+            if stage_id != 0:
+                _t_preprocess = _time.perf_counter()
+                try:
+                    expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
+                    prompt = await self._build_entry_stage_request(
+                        request_id,
+                        stage_id,
+                        prompt,
+                        req_state,
+                        lora_request=msg.lora_request,
+                        replica_id=expected_replica_id,
+                    )
+                except StageUnavailableError:
+                    await self._fail_request_dead_stage(request_id, stage_id)
+                    return
+                except (ValueError, VLLMClientError) as exc:
+                    await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
+                    # Rejected input fails only this request, as at stage 0.
+                    logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                    await self._fail_request_client_error(request_id, stage_id, str(exc))
+                    return
+                if self.request_states.get(request_id) is not req_state:
+                    await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
+                    return
+                req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
+            req_state.stage_submit_ts[stage_id] = _time.time()
+            if not await self._dispatch_or_fail_request(
+                lambda: self.stage_pools[stage_id].submit_initial(
                     request_id,
-                    stage_id,
-                    prompt,
                     req_state,
-                    lora_request=msg.lora_request,
-                    replica_id=expected_replica_id,
-                )
-            except StageUnavailableError:
-                await self._fail_request_dead_stage(request_id, stage_id)
+                    prompt,
+                    prompt_text=msg.output_prompt_text,
+                    expected_replica_id=expected_replica_id,
+                ),
+                req_id=request_id,
+                stage_id=stage_id,
+                operation="add_request",
+            ):
+                if stage_id != 0:
+                    await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                 return
-            except (ValueError, VLLMClientError) as exc:
-                # Rejected input (too long, invalid media, ...), which the stage-0
-                # path raises before admission: fail only this request.
-                logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
-                await self._fail_request_client_error(request_id, stage_id, str(exc))
-                return
-            if self.request_states.get(request_id) is not req_state:
-                # Cleaned up while its input was being processed.
-                await asyncio.to_thread(self._forget_unsent_mm_items, stage_id, prompt)
-                return
-            req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[stage_id].submit_initial(
-                request_id,
-                req_state,
-                prompt,
-                prompt_text=msg.output_prompt_text,
-                expected_replica_id=expected_replica_id,
-            ),
-            req_id=request_id,
-            stage_id=stage_id,
-            operation="add_request",
-        ):
-            return
 
         if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)
