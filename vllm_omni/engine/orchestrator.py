@@ -2072,21 +2072,28 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
-    def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> Any:
-        """Bind the receiving replica before multimodal processing and return the prompt with
-        its cache keys scoped to it."""
+    def _preselect_stage_mm_cache_replica(self, req_id: str, stage_id: int, prompt: Any) -> int | None:
+        """Bind the receiving replica when the prompt's multimodal cache keys must name it: it
+        carries media, and the stage has a sender cache and more than one live replica."""
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
-            return prompt
+            return None
         pool = self.stage_pools[stage_id]
-        if pool.live_num_replicas <= 1:
-            return prompt
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        cache_gb = getattr(getattr(model_config, "multimodal_config", None), "mm_processor_cache_gb", 0)
+        if pool.live_num_replicas <= 1 or not cache_gb:
+            return None
         replica_id = pool.preselect_replica_id(req_id)
         if replica_id is None:
             # No serviceable replica yet (distributed mode): unscoped keys could let the
             # sender omit media for the replica that ends up receiving the request.
             raise StageUnavailableError(f"stage {stage_id} has no serviceable replica to bind")
-        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        return replica_id
+
+    def _scope_stage_mm_cache_to_replica(self, stage_id: int, prompt: Any, replica_id: int) -> Any:
+        """Return the prompt with its multimodal cache keys scoped to ``replica_id``."""
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        model_config = getattr(self.stage_pools[stage_id].stage_vllm_config, "model_config", None)
         mm_config = getattr(model_config, "multimodal_config", None)
         scoped = [
             scope_stage_replica_mm_uuids(
@@ -2100,19 +2107,21 @@ class OrchestratorBase:
         ]
         return scoped if isinstance(prompt, list) else scoped[0]
 
-    def _build_entry_stage_request(
+    async def _build_entry_stage_request(
         self,
         req_id: str,
         stage_id: int,
         prompt: Any,
         req_state: OrchestratorRequestState,
         lora_request: Any = None,
+        replica_id: int | None = None,
     ) -> Any:
         """Process a bypassing request's raw prompt with the input processor that also prepares the
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
-        prompt = self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
+        if replica_id is not None:
+            prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
         processor = self._get_stage_input_processor(stage_id)
-        request = processor.process_inputs(
+        request = await processor.process_inputs_async(
             request_id=req_id,
             prompt=prompt,
             params=req_state.sampling_params_list[stage_id],
@@ -2127,7 +2136,7 @@ class OrchestratorBase:
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
         return isinstance(next_input, dict) and "prompt_token_ids" in next_input
 
-    def _build_next_stage_request(
+    async def _build_next_stage_request(
         self,
         req_id: str,
         next_stage_id: int,
@@ -2137,6 +2146,7 @@ class OrchestratorBase:
         mm_features: list | None = None,
         resumable: bool = False,
         payload_sender_info: dict[str, Any] | None = None,
+        replica_id: int | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2152,7 +2162,10 @@ class OrchestratorBase:
             request.payload_sender_info = payload_sender_info
             return request
 
-        next_input = self._scope_stage_mm_cache_to_replica(req_id, next_stage_id, next_input)
+        if replica_id is not None:
+            next_input = await asyncio.to_thread(
+                self._scope_stage_mm_cache_to_replica, next_stage_id, next_input, replica_id
+            )
         processor = self._get_stage_input_processor(next_stage_id)
         # A pooling stage is driven by PoolingParams; vLLM validates them against
         # the stage's supported tasks, so advertise the model's pooling tasks (or
@@ -2162,7 +2175,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
-        request = processor.process_inputs(
+        request = await processor.process_inputs_async(
             request_id=req_id,
             prompt=next_input,
             params=params,
@@ -2719,7 +2732,12 @@ class OrchestratorBase:
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             try:
-                request = self._build_next_stage_request(
+                scoped_replica_id = (
+                    None
+                    if self._next_stage_input_is_tokens(next_input)
+                    else self._preselect_stage_mm_cache_replica(req_id, next_logical, next_input)
+                )
+                request = await self._build_next_stage_request(
                     req_id,
                     next_logical,
                     next_input,
@@ -2727,6 +2745,7 @@ class OrchestratorBase:
                     mm_features=mm_features,
                     resumable=next_stage_resumable,
                     payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
+                    replica_id=scoped_replica_id,
                 )
             except (ValueError, VLLMClientError) as exc:
                 # The forwarded input failed this stage's own validation (e.g. more
@@ -2739,11 +2758,15 @@ class OrchestratorBase:
                     req_id, next_logical, str(exc), release_owners=req_state.session_owned
                 )
                 return
+            if self.request_states.get(req_id) is not req_state:
+                return  # Cleaned up while its input was being processed.
 
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(
+                    req_id, req_state, request, prompt_text=None, expected_replica_id=scoped_replica_id
+                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3180,21 +3203,30 @@ class Orchestrator(OrchestratorBase):
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        expected_replica_id = None
         if stage_id != 0:
             _t_preprocess = _time.perf_counter()
             try:
-                prompt = self._build_entry_stage_request(
-                    request_id, stage_id, prompt, req_state, lora_request=msg.lora_request
+                expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
+                prompt = await self._build_entry_stage_request(
+                    request_id,
+                    stage_id,
+                    prompt,
+                    req_state,
+                    lora_request=msg.lora_request,
+                    replica_id=expected_replica_id,
                 )
             except StageUnavailableError:
                 await self._fail_request_dead_stage(request_id, stage_id)
                 return
-            except Exception as exc:
+            except (ValueError, VLLMClientError) as exc:
                 # Rejected input (too long, invalid media, ...), which the stage-0
                 # path raises before admission: fail only this request.
                 logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
                 await self._fail_request_client_error(request_id, stage_id, str(exc))
                 return
+            if self.request_states.get(request_id) is not req_state:
+                return  # Cleaned up while its input was being processed.
             req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
         req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
@@ -3203,6 +3235,7 @@ class Orchestrator(OrchestratorBase):
                 req_state,
                 prompt,
                 prompt_text=msg.output_prompt_text,
+                expected_replica_id=expected_replica_id,
             ),
             req_id=request_id,
             stage_id=stage_id,

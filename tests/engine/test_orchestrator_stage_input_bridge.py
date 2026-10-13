@@ -88,7 +88,7 @@ class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def process_inputs(self, **kwargs):
+    async def process_inputs_async(self, **kwargs):
         self.calls.append(kwargs)
         return SimpleNamespace(
             request_id=kwargs["request_id"],
@@ -192,6 +192,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
         final_stage_id=1,
     )
+    orchestrator.request_states[req_state.request_id] = req_state
 
     await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 

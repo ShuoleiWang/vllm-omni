@@ -516,14 +516,15 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
 
-    # Replica 0 leaves the hub after req-1's keys were scoped to it: submit fails
-    # the request instead of sending those keys to replica 1.
+    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
+    # those keys fails instead of sending them to replica 1, while routing moves on.
     stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
     with pytest.raises(StageUnavailableError):
         await stage_pool.submit_initial(
-            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request()
+            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
         )
     assert stage_pool.get_bound_replica_id("req-1") is None
+    assert await stage_pool.pick("req-1") == 1
 
 
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):

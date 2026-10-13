@@ -1008,6 +1008,7 @@ class StagePool:
         affinity_request_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
+        expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
@@ -1032,17 +1033,17 @@ class StagePool:
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        # A request bound before submit (preselected for multimodal cache scoping)
-        # must not move: its cache keys name that replica, which may be gone now.
-        preselected = self.get_bound_replica_id(request_id)
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
         )
-        if preselected is not None and replica_id != preselected:
+        # A request whose multimodal cache keys name a replica must not move: that
+        # replica's sender-cache entries may omit media the new one never received.
+        if expected_replica_id is not None and replica_id != expected_replica_id:
             self.release_binding(request_id)
             raise StageUnavailableError(
-                f"stage {self.stage_id} replica {preselected} bound to {request_id} became unavailable before submit"
+                f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
+                "unavailable before submit"
             )
         client = self.clients[replica_id]
         if client is None:

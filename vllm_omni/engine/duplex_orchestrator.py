@@ -12,8 +12,6 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
-import asyncio
-import threading
 import time as _time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -81,7 +79,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._prompt_processing_lock = threading.Lock()
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.session_manager = DuplexSessionManager(
@@ -372,12 +369,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request = OmniEngineCoreRequest.from_request(request)
         return request
 
-    def _process_turn_prompt(self, *args, **kwargs):
-        # Input processors own mutable caches. Hold a thread lock even if the
-        # awaiting session is cancelled while its preprocessing is still running.
-        with self._prompt_processing_lock:
-            return self._build_next_stage_request(*args, **kwargs)
-
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
         request_state = self.request_states.get(context.request_id)
@@ -400,8 +391,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request_state.prompt = dict(submission.prompt)
             # Use the ordinary multimodal input processor for turn-model plugins.
             # Its CPU preprocessing runs off the session/orchestrator event loop.
-            request = await asyncio.to_thread(
-                self._process_turn_prompt,
+            request = await self._build_next_stage_request(
                 context.request_id,
                 context.stage_id,
                 dict(submission.prompt),

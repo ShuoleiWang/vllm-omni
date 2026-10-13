@@ -651,11 +651,11 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
     lora = LoRARequest("adapter", 1, "/adapters/adapter")
     processed_prompts: list[Any] = []
 
-    def process_inputs(*, request_id, prompt, params, **kwargs):
+    async def process_inputs(*, request_id, prompt, params, **kwargs):
         processed_prompts.append((prompt, kwargs.get("lora_request")))
         return _processed_request(request_id, params)
 
-    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
 
     try:
         await _enqueue_add_request(
@@ -688,9 +688,11 @@ async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) 
     stage1 = FakeStageClient(stage_type="llm", final_output=False)
     stage2 = FakeStageClient(stage_type="llm", final_output=True)
     orchestrator_fixture = orchestrator_factory([stage0, stage1, stage2], async_chunk=True)
-    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
-        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params)
-    )
+
+    async def process_inputs(*, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
 
     try:
         await _enqueue_add_request(
@@ -711,29 +713,45 @@ async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) 
         await _shutdown_orchestrator(orchestrator_fixture)
 
 
-def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
+@pytest.mark.asyncio
+async def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     """The same image reaching a replicated stage 1 by either path is keyed per receiving
-    replica, and processing fails while no replica can be bound."""
+    replica; binding fails while no replica is serviceable and is skipped without a sender cache."""
     orchestrator = object.__new__(Orchestrator)
+    mm_config = SimpleNamespace(mm_processor_cache_gb=4)
     orchestrator.stage_pools = [
         StagePool(0, [FakeStageClient()]),
-        StagePool(1, [FakeStageClient(final_output=True), FakeStageClient(final_output=True)]),
+        StagePool(
+            1,
+            [FakeStageClient(final_output=True), FakeStageClient(final_output=True)],
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(multimodal_config=mm_config)),
+        ),
     ]
     seen_uuids: dict[str, str] = {}
 
-    def process_inputs(*, request_id, prompt, params, **kwargs):
+    async def process_inputs(*, request_id, prompt, params, **kwargs):
         seen_uuids[request_id] = prompt["multi_modal_uuids"]["image"][0]
         return _processed_request(request_id, params)
 
-    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs=process_inputs)}
+    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs_async=process_inputs)}
     req_state = SimpleNamespace(
         sampling_params_list=[_sampling_params(), _sampling_params()], request_timestamp=0.0, final_stage_id=1
     )
-    orchestrator._build_entry_stage_request(
-        "req-bypass", 1, {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}, req_state
+    bypass_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    forwarded_prompt = {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}
+    await orchestrator._build_entry_stage_request(
+        "req-bypass",
+        1,
+        bypass_prompt,
+        req_state,
+        replica_id=orchestrator._preselect_stage_mm_cache_replica("req-bypass", 1, bypass_prompt),
     )
-    orchestrator._build_next_stage_request(
-        "req-forwarded", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
+    await orchestrator._build_next_stage_request(
+        "req-forwarded",
+        1,
+        forwarded_prompt,
+        _sampling_params(),
+        replica_id=orchestrator._preselect_stage_mm_cache_replica("req-forwarded", 1, forwarded_prompt),
     )
 
     stage1_pool = orchestrator.stage_pools[1]
@@ -745,10 +763,9 @@ def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     # A distributed pool whose snapshot has no UP replica yet cannot bind one.
     stage1_pool.preselect_replica_id = lambda req_id: None
     with pytest.raises(StageUnavailableError):
-        orchestrator._build_next_stage_request(
-            "req-unbound", 1, {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}, _sampling_params()
-        )
-    assert "req-unbound" not in seen_uuids
+        orchestrator._preselect_stage_mm_cache_replica("req-unbound", 1, forwarded_prompt)
+    mm_config.mm_processor_cache_gb = 0
+    assert orchestrator._preselect_stage_mm_cache_replica("req-unbound", 1, forwarded_prompt) is None
 
 
 @pytest.mark.asyncio

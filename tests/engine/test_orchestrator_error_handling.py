@@ -1116,14 +1116,14 @@ async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> Non
     """A forwarded prompt that fails the next stage's own validation (here more tokens
     than it accepts) fails only that request instead of escaping the orchestrator loop."""
 
-    def process_inputs(**kwargs):
+    async def process_inputs(**kwargs):
         raise VLLMValidationError("The decoder prompt is longer than the maximum model length of 16384.")
 
     stage1 = FakeStageClient(
         final_output=True, next_inputs=[{"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}]
     )
     orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [stage1]]))
-    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
     state = OrchestratorRequestState(
         request_id="too-long",
         prompt={"prompt_token_ids": [1]},
