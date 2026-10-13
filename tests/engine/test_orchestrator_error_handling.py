@@ -1114,16 +1114,26 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
 @pytest.mark.asyncio
 async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> None:
     """A forwarded prompt that fails the next stage's own validation (here more tokens
-    than it accepts) fails only that request instead of escaping the orchestrator loop."""
+    than it accepts) fails only that request instead of escaping the orchestrator loop.
+    One aborted while it is processed is not submitted, and the stage's sender cache
+    forgets its media."""
 
-    async def process_inputs(**kwargs):
+    def process_inputs(*, request_id, **kwargs):
+        if request_id == "aborted":
+            sent.add("frame-0-hash")  # The sender cache records the image as sent,
+            orchestrator.request_states.pop(request_id)  # and the abort lands mid-processing.
+            return SimpleNamespace(mm_features=[SimpleNamespace(mm_hash="frame-0-hash", identifier="frame-0-hash")])
         raise VLLMValidationError("The decoder prompt is longer than the maximum model length of 16384.")
 
     stage1 = FakeStageClient(
         final_output=True, next_inputs=[{"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}]
     )
     orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [stage1]]))
-    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
+    sent: set[str] = set()
+    orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=process_inputs,
+        renderer=SimpleNamespace(mm_processor_cache=SimpleNamespace(invalidate=sent.discard)),
+    )
     state = OrchestratorRequestState(
         request_id="too-long",
         prompt={"prompt_token_ids": [1]},
@@ -1139,6 +1149,17 @@ async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> Non
         assert (error.request_id, error.stage_id, error.status_code, error.fatal) == ("too-long", 1, 400, False)
         assert stage1.add_request_calls == []
         assert state.request_id not in orchestrator.request_states
+
+        aborted = OrchestratorRequestState(
+            request_id="aborted",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        orchestrator.request_states[aborted.request_id] = aborted
+        await orchestrator._route_output(0, 0, _build_request_output(aborted.request_id), aborted, stage_metrics=None)
+        assert stage1.add_request_calls == []
+        assert sent == set()
     finally:
         for q in queues:
             q.close()

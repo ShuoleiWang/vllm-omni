@@ -651,11 +651,11 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
     lora = LoRARequest("adapter", 1, "/adapters/adapter")
     processed_prompts: list[Any] = []
 
-    async def process_inputs(*, request_id, prompt, params, **kwargs):
+    def process_inputs(*, request_id, prompt, params, **kwargs):
         processed_prompts.append((prompt, kwargs.get("lora_request")))
         return _processed_request(request_id, params)
 
-    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
 
     try:
         await _enqueue_add_request(
@@ -688,11 +688,9 @@ async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) 
     stage1 = FakeStageClient(stage_type="llm", final_output=False)
     stage2 = FakeStageClient(stage_type="llm", final_output=True)
     orchestrator_fixture = orchestrator_factory([stage0, stage1, stage2], async_chunk=True)
-
-    async def process_inputs(*, request_id, params, **kwargs):
-        return _processed_request(request_id, params)
-
-    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs_async=process_inputs)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params)
+    )
 
     try:
         await _enqueue_add_request(
@@ -729,14 +727,16 @@ async def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
     ]
     seen_uuids: dict[str, str] = {}
 
-    async def process_inputs(*, request_id, prompt, params, **kwargs):
+    def process_inputs(*, request_id, prompt, params, **kwargs):
         seen_uuids[request_id] = prompt["multi_modal_uuids"]["image"][0]
         return _processed_request(request_id, params)
 
-    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs_async=process_inputs)}
+    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs=process_inputs)}
+    orchestrator._prompt_processing_lock = threading.RLock()
     req_state = SimpleNamespace(
         sampling_params_list=[_sampling_params(), _sampling_params()], request_timestamp=0.0, final_stage_id=1
     )
+    orchestrator.request_states = {"req-bypass": req_state, "req-forwarded": req_state}
     bypass_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
     forwarded_prompt = {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}
     await orchestrator._build_entry_stage_request(

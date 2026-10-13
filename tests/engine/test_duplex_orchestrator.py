@@ -479,7 +479,7 @@ async def test_qwen_terminal_stage_error_allows_a_subsequent_turn(mocker) -> Non
     orchestrator, clients, rpc_q, output_q = _build(plugin=plugin)
     output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
 
-    async def process_inputs(**kwargs):
+    def process_inputs(**kwargs):
         return build_engine_core_request_from_tokens(
             request_id=kwargs["request_id"],
             prompt={"prompt_token_ids": [1, 2]},
@@ -489,7 +489,7 @@ async def test_qwen_terminal_stage_error_allows_a_subsequent_turn(mocker) -> Non
         )
 
     mocker.patch.object(
-        orchestrator, "_get_stage_input_processor", return_value=SimpleNamespace(process_inputs_async=process_inputs)
+        orchestrator, "_get_stage_input_processor", return_value=SimpleNamespace(process_inputs=process_inputs)
     )
     assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, output_buffer=output_buffer)).ok
     session = orchestrator.session_manager.get(SESSION_ID)
@@ -749,7 +749,7 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
     orchestrator.plugin = orchestrator.session_manager.plugin = plugin
     seen = []
 
-    async def process_inputs(**kwargs):
+    def process_inputs(**kwargs):
         seen.append(kwargs)
         return build_engine_core_request_from_tokens(
             request_id=kwargs["request_id"],
@@ -760,9 +760,7 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
         )
 
     monkeypatch.setattr(
-        orchestrator,
-        "_get_stage_input_processor",
-        lambda stage_id: SimpleNamespace(process_inputs_async=process_inputs),
+        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
     )
     await orchestrator._dispatch_message(
         OpenDuplexSessionMessage(

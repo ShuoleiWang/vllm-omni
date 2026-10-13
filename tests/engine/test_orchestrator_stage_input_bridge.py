@@ -88,7 +88,7 @@ class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def process_inputs_async(self, **kwargs):
+    def process_inputs(self, **kwargs):
         self.calls.append(kwargs)
         return SimpleNamespace(
             request_id=kwargs["request_id"],

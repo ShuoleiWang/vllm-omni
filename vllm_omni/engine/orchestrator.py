@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import threading
 import time as _time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
@@ -410,6 +411,7 @@ class OrchestratorBase:
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
+        self._prompt_processing_lock = threading.RLock()
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
@@ -2072,6 +2074,26 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
+    def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+        # Input processors own mutable caches. Hold a thread lock even if the
+        # awaiting request is cancelled while its preprocessing is still running.
+        with self._prompt_processing_lock:
+            request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+            if kwargs["request_id"] not in self.request_states:
+                # Cleaned up meanwhile: forget its media before the next request reads the cache.
+                self._forget_unsent_mm_items(stage_id, request)
+            return request
+
+    def _forget_unsent_mm_items(self, stage_id: int, request: Any) -> None:
+        """Drop the media of a processed request that will not be submitted from the stage's
+        sender cache, which recorded them as sent."""
+        processor = self._stage_input_processors.get(stage_id)
+        cache = processor.renderer.mm_processor_cache if processor is not None else None
+        if cache is not None:
+            with self._prompt_processing_lock:
+                for feature in request.mm_features or ():
+                    cache.invalidate(feature.mm_hash or feature.identifier)
+
     def _preselect_stage_mm_cache_replica(self, req_id: str, stage_id: int, prompt: Any) -> int | None:
         """Bind the receiving replica when the prompt's multimodal cache keys must name it: it
         carries media, and the stage has a sender cache and more than one live replica."""
@@ -2120,8 +2142,9 @@ class OrchestratorBase:
         prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
         if replica_id is not None:
             prompt = await asyncio.to_thread(self._scope_stage_mm_cache_to_replica, stage_id, prompt, replica_id)
-        processor = self._get_stage_input_processor(stage_id)
-        request = await processor.process_inputs_async(
+        request = await asyncio.to_thread(
+            self._process_stage_inputs,
+            stage_id,
             request_id=req_id,
             prompt=prompt,
             params=req_state.sampling_params_list[stage_id],
@@ -2166,7 +2189,6 @@ class OrchestratorBase:
             next_input = await asyncio.to_thread(
                 self._scope_stage_mm_cache_to_replica, next_stage_id, next_input, replica_id
             )
-        processor = self._get_stage_input_processor(next_stage_id)
         # A pooling stage is driven by PoolingParams; vLLM validates them against
         # the stage's supported tasks, so advertise the model's pooling tasks (or
         # the configured task) instead of generate.
@@ -2175,7 +2197,9 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
-        request = await processor.process_inputs_async(
+        request = await asyncio.to_thread(
+            self._process_stage_inputs,
+            next_stage_id,
             request_id=req_id,
             prompt=next_input,
             params=params,
@@ -2759,7 +2783,9 @@ class OrchestratorBase:
                 )
                 return
             if self.request_states.get(req_id) is not req_state:
-                return  # Cleaned up while its input was being processed.
+                # Cleaned up while its input was being processed.
+                await asyncio.to_thread(self._forget_unsent_mm_items, next_logical, request)
+                return
 
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
@@ -3226,7 +3252,9 @@ class Orchestrator(OrchestratorBase):
                 await self._fail_request_client_error(request_id, stage_id, str(exc))
                 return
             if self.request_states.get(request_id) is not req_state:
-                return  # Cleaned up while its input was being processed.
+                # Cleaned up while its input was being processed.
+                await asyncio.to_thread(self._forget_unsent_mm_items, stage_id, prompt)
+                return
             req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
         req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
