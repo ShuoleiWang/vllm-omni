@@ -13,7 +13,7 @@ and applies the session-owned policy.
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -372,10 +372,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         if submission.resumable:
             return await self._submit_stage_request(submission)
-        async with self._stage_input_submission(submission.context.stage_id):
-            return await self._submit_stage_request(submission)
+        async with self._stage_input_submission(submission.context.stage_id) as mark_submitting:
+            return await self._submit_stage_request(submission, mark_submitting=mark_submitting)
 
-    async def _submit_stage_request(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+    async def _submit_stage_request(
+        self, submission: DuplexStageSubmission, *, mark_submitting: Callable[[], None] | None = None
+    ) -> DuplexStageSubmissionResult:
         context = submission.context
         request_state = self.request_states.get(context.request_id)
         if not isinstance(request_state, DuplexOrchestratorRequestState):
@@ -411,6 +413,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if mm_features is not None:
             request_state.mm_features = mm_features
         pool = self.stage_pools[context.stage_id]
+        if mark_submitting is not None:
+            mark_submitting()
         if submission.already_submitted:
             if not submission.resumable:
                 raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")

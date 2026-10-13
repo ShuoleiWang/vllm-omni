@@ -106,6 +106,8 @@ class FakePromptRequest:
 
 
 class FakeStageClient:
+    sample_rate: int
+
     def __init__(
         self,
         *,
@@ -135,8 +137,8 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
+        self._diffusion_outputs: queue.Queue[Any] = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
@@ -231,7 +233,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 
 class FakeOutputProcessor:
-    def __init__(self, *, request_outputs: list[object] | None = None) -> None:
+    def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
@@ -392,9 +394,9 @@ def _build_stage_pools(
 
 
 def _build_harness(
-    stage_clients: list[object],
+    stage_clients: list[FakeStageClient],
     *,
-    output_processors: list[object] | None = None,
+    output_processors: list[FakeOutputProcessor] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     log_stats: bool = False,
@@ -655,7 +657,9 @@ async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factor
         processed_prompts.append((prompt, kwargs.get("lora_request")))
         return _processed_request(request_id, params)
 
-    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=process_inputs, renderer=SimpleNamespace(mm_processor_cache=None)
+    )
 
     try:
         await _enqueue_add_request(
@@ -689,7 +693,8 @@ async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) 
     stage2 = FakeStageClient(stage_type="llm", final_output=True)
     orchestrator_fixture = orchestrator_factory([stage0, stage1, stage2], async_chunk=True)
     orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
-        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params)
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params),
+        renderer=SimpleNamespace(mm_processor_cache=None),
     )
 
     try:

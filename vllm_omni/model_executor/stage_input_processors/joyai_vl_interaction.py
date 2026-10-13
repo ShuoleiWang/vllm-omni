@@ -76,6 +76,8 @@ def asr_to_joyai(
             joyai_input["multi_modal_data"] = visual_inputs
         if request_prompt.get("mm_processor_kwargs") is not None:
             joyai_input["mm_processor_kwargs"] = request_prompt["mm_processor_kwargs"]
+        if request_prompt.get("cache_salt") is not None:
+            joyai_input["cache_salt"] = request_prompt["cache_salt"]
         joyai_inputs.append(joyai_input)
     return joyai_inputs
 

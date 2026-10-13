@@ -21,6 +21,17 @@ _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
 _VIDEO = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
+@pytest.mark.parametrize("salt", [None, "tenant-a", "tenant-b"])
+def test_asr_to_joyai_preserves_cache_salt(salt):
+    prompt = {"cache_salt": salt} if salt is not None else {}
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="hello")])
+    (result,) = joyai_bridge.asr_to_joyai([output], prompt)
+    if salt is None:
+        assert "cache_salt" not in result
+    else:
+        assert result["cache_salt"] == salt
+
+
 def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
     """The cleaned transcript becomes JoyAI's user query, followed by the deferred visuals."""
     client = object.__new__(StageEngineCoreClient)

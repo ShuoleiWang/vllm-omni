@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+from vllm.exceptions import VLLMValidationError
 from vllm.renderers import BaseRenderer
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.registry import cached_tokenizer_from_config, tokenizer_args_from_config
@@ -52,8 +53,26 @@ class OmniRenderer:
     def _routes_no_media_kwargs(prompt) -> bool:
         return "prompt_embeds" not in prompt and "mm_processor_kwargs" in prompt and not prompt.get("multi_modal_data")
 
+    def _validate_video_processor_kwargs(self, prompt) -> None:
+        renderer = cast(BaseRenderer, self)
+        if "video" not in (prompt.get("multi_modal_data") or {}):
+            return
+        if getattr(renderer.model_config.hf_config, "model_type", None) not in ("qwen3_vl", "qwen3_vl_moe"):
+            return
+        processor = renderer.get_mm_processor()
+        kwargs = processor.info.ctx.get_merged_mm_kwargs(prompt.get("mm_processor_kwargs") or {}, modality="video")
+        # Qwen3-VL merges this dict before entering its HF error wrapper.
+        # Reject malformed request options here; unrelated TypeErrors still
+        # propagate as internal failures rather than being hidden as bad input.
+        size = kwargs.get("size")
+        if size is not None and not isinstance(size, dict):
+            raise VLLMValidationError(
+                "Video processor size must be a dictionary.", parameter="mm_processor_kwargs", value=size
+            )
+
     def _process_singleton(self, prompt, *, skip_mm_cache: bool = False, tok_params=None):
         renderer = cast(BaseRenderer, self)
+        self._validate_video_processor_kwargs(prompt)
         if self._routes_no_media_kwargs(prompt):
             inputs = renderer._process_multimodal(
                 prompt["prompt_token_ids"],
@@ -71,6 +90,7 @@ class OmniRenderer:
 
     async def _process_singleton_async(self, prompt, *, skip_mm_cache: bool = False, tok_params=None):
         renderer = cast(BaseRenderer, self)
+        self._validate_video_processor_kwargs(prompt)
         if self._routes_no_media_kwargs(prompt):
             inputs = await renderer._process_multimodal_async(
                 prompt["prompt_token_ids"],

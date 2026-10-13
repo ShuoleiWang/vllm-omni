@@ -118,6 +118,37 @@ def test_omni_renderer_is_a_real_subclass_created_once():
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("size", [123, "bad", [], None, {"shortest_edge": 4096}])
+def test_qwen_video_size_validation_precedes_multimodal_processing(renderer, mocker, async_mode, size):
+    renderer.model_config.hf_config = SimpleNamespace(model_type="qwen3_vl")
+    renderer.get_mm_processor = mocker.Mock(
+        return_value=SimpleNamespace(info=SimpleNamespace(ctx=SimpleNamespace(get_merged_mm_kwargs=lambda kw, **_: kw)))
+    )
+    prompt = {"prompt": "video", "multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": {"size": size}}
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt]))
+        return renderer.render_cmpl([prompt])
+
+    if size is not None and not isinstance(size, dict):
+        with pytest.raises(VLLMValidationError, match="size must be a dictionary"):
+            render()
+        renderer._process_multimodal.assert_not_called()
+    else:
+        render()
+        renderer._process_multimodal.assert_called_once()
+
+
+def test_other_video_processors_keep_their_own_size_contract(renderer):
+    renderer.model_config.hf_config = SimpleNamespace(model_type="other")
+    renderer.render_cmpl(
+        [{"prompt": "video", "multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": {"size": 224}}]
+    )
+    renderer._process_multimodal.assert_called_once()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("no_media_kwargs", [False, True])
 @pytest.mark.parametrize("limit", [2, 4])
 def test_renderer_applies_expanded_prompt_bound_without_splitting_media(renderer, async_mode, no_media_kwargs, limit):

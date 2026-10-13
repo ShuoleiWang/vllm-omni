@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex_orchestrator import DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.orchestrator import OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.inputs.preprocess import OmniRenderer
 
 from .test_duplex_orchestrator import _build as _build_duplex
 from .test_orchestrator import (
@@ -208,6 +209,171 @@ async def test_rollback_preserves_outstanding_shm_media(cache_pipeline, monkeypa
     finally:
         receiver._shm_cache.close()
         sender.close()
+
+
+@pytest.fixture
+def shm_pipeline(cache_pipeline, monkeypatch, request):
+    p = cache_pipeline
+    monkeypatch.setenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", f"pr8031-{uuid.uuid4().hex}")
+    readers = request.param
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(world_size=readers),
+        model_config=SimpleNamespace(
+            get_multimodal_config=lambda: SimpleNamespace(
+                mm_processor_cache_gb=0.001, mm_shm_cache_max_object_size_mb=1
+            )
+        ),
+    )
+    p.sender = ShmObjectStoreSenderCache(config)
+    p.receiver = ShmObjectStoreReceiverCache(config, multiprocessing.Lock())
+    processor = p.orch._stage_input_processors[1]
+    monkeypatch.setattr(processor.renderer, "mm_processor_cache", p.sender)
+
+    def process_inputs(*, request_id, params, **kwargs):
+        key = p.media_keys.get(request_id, request_id)
+        media = {"pixel_values": bytes(400 * 1024)}
+        p.sender.touch_sender_cache_item(key)
+        data, _ = p.sender.get_and_update_item((media, []), key)
+        p.processed.append((request_id, data))
+        if request_id == "too-long":
+            raise VLLMValidationError("prompt too long")
+        if request_id == "cancelled":
+            p.orch.request_states.pop(request_id)
+        result = _processed_request(request_id, params)
+        result.mm_features = [SimpleNamespace(mm_hash=key, identifier=key, data=data)]
+        return result
+
+    async def receive(request_id, state, result, **kwargs):
+        feature = result.mm_features[0]
+        for _ in range(readers):
+            received = SimpleNamespace(mm_hash=feature.mm_hash, identifier=feature.identifier, data=feature.data)
+            p.receiver.get_and_update_features([received])
+            assert received.data == {"pixel_values": bytes(400 * 1024)}
+        p.received.append(request_id)
+        return 0
+
+    monkeypatch.setattr(processor, "process_inputs", process_inputs)
+    monkeypatch.setattr(p.orch.stage_pools[1], "submit_initial", receive)
+    try:
+        yield p
+    finally:
+        p.receiver._shm_cache.close()
+        p.sender.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shm_pipeline", [1, 2], indirect=True)
+@pytest.mark.parametrize("path", ["bypass", "forward"])
+@pytest.mark.parametrize("failure", ["too-long", "cancelled"])
+@pytest.mark.parametrize("retry_same_image", [False, True])
+async def test_unsent_shm_references_do_not_exhaust_cache(shm_pipeline, path, failure, retry_same_image):
+    p = shm_pipeline
+    await p.submit(failure, path)
+    if retry_same_image:
+        p.media_keys["valid-0"] = failure
+    for i in range(5):
+        await p.submit(f"valid-{i}", path)
+        assert "address" in p.processed[-1][1], "unsent references must not force full-payload fallback"
+    assert p.received == [f"valid-{i}" for i in range(5)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shm_pipeline", [1, 2], indirect=True)
+@pytest.mark.parametrize("path", ["bypass", "forward"])
+async def test_shm_failed_retries_preserve_unread_older_media(shm_pipeline, path):
+    p = shm_pipeline
+    original = {"pixel_values": bytes(400 * 1024)}
+    p.sender.touch_sender_cache_item("older")
+    outstanding, _ = p.sender.get_and_update_item((original, []), "older")
+    storage = p.sender._shm_cache
+    older_id = outstanding["monotonic_id"].data
+    before = storage.writer_flag[older_id]
+
+    # The unread older allocation blocks FIFO eviction of the failed one.
+    await p.submit("too-long", path)
+    await p.submit("too-long", path)
+    assert storage.writer_flag[older_id] == before
+    p.media_keys["retry"] = "too-long"
+    await p.submit("retry", path)
+    assert "address" in p.processed[-1][1]
+    for _ in range(storage.n_readers):
+        feature = SimpleNamespace(mm_hash="older", identifier="older", data=outstanding)
+        p.receiver.get_and_update_features([feature])
+        assert feature.data == original
+    for i in range(5):
+        await p.submit(f"valid-{i}", path)
+        assert "address" in p.processed[-1][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shm_pipeline", [1], indirect=True)
+async def test_shm_rollback_preserves_prior_refs_and_removes_hits_and_touches(shm_pipeline):
+    p = shm_pipeline
+    original = {"pixel_values": [1, 2, 3]}
+    outstanding, _ = p.sender.get_and_update_item((original, []), "A")
+    refs = p.sender._shm_cache.writer_flag
+    before = refs.copy()
+    with pytest.raises(ValueError):
+        async with p.orch._stage_input_submission(1):
+            p.sender.get_and_update_item((None, []), "A")
+            p.sender.touch_sender_cache_item("A")
+            raise ValueError("rejected")
+    assert refs == before
+    assert p.receiver.get_and_update_item(outstanding, "A") == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shm_pipeline", [1], indirect=True)
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_shm_submission_uncertainty_keeps_receiver_references(shm_pipeline, failure):
+    p = shm_pipeline
+    original = {"pixel_values": [1, 2, 3]}
+    with pytest.raises(failure):
+        async with p.orch._stage_input_submission(1) as mark_submitting:
+            outstanding, _ = p.sender.get_and_update_item((original, []), "A")
+            before = p.sender._shm_cache.writer_flag.copy()
+            mark_submitting()
+            raise failure()
+    assert p.sender._shm_cache.writer_flag == before
+    assert p.receiver.get_and_update_item(outstanding, "A") == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["bypass", "forward"])
+async def test_malformed_video_options_fail_only_the_request(cache_pipeline, monkeypatch, mocker, path):
+    p = cache_pipeline
+    processor = p.orch._stage_input_processors[1]
+    renderer = processor.renderer
+    renderer.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_vl"))
+    renderer.get_mm_processor = mocker.Mock(
+        return_value=SimpleNamespace(info=SimpleNamespace(ctx=SimpleNamespace(get_merged_mm_kwargs=lambda kw, **_: kw)))
+    )
+    original = processor.process_inputs
+
+    def process_inputs(**kwargs):
+        if kwargs["request_id"] == "bad-video":
+            OmniRenderer._validate_video_processor_kwargs(
+                renderer, {"multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": {"size": 123}}
+            )
+        return original(**kwargs)
+
+    monkeypatch.setattr(processor, "process_inputs", process_inputs)
+    await p.submit("bad-video", path)
+    assert "bad-video" not in p.orch.request_states
+    error = p.orch.output_async_queue.get_nowait()
+    assert error.request_id == "bad-video" and error.status_code == 400 and not error.fatal
+    await p.submit("valid", path)
+    assert p.received == ["valid"]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_processing_type_error_still_propagates(cache_pipeline, monkeypatch, mocker):
+    p = cache_pipeline
+    monkeypatch.setattr(
+        p.orch._stage_input_processors[1], "process_inputs", mocker.Mock(side_effect=TypeError("internal bug"))
+    )
+    with pytest.raises(TypeError, match="internal bug"):
+        await p.submit("broken", "bypass")
 
 
 @pytest.mark.asyncio

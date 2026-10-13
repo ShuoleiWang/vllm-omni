@@ -46,7 +46,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
@@ -87,6 +87,7 @@ class FakeOutputProcessor:
 class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.renderer = SimpleNamespace(mm_processor_cache=None)
 
     def process_inputs(self, **kwargs):
         self.calls.append(kwargs)

@@ -31,6 +31,7 @@ from vllm.config import ModelConfig
 from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
+from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -2109,23 +2110,71 @@ class OrchestratorBase:
                 cache.clear_cache()
 
     @asynccontextmanager
-    async def _stage_input_submission(self, stage_id: int) -> AsyncIterator[None]:
+    async def _stage_input_submission(self, stage_id: int) -> AsyncIterator[Callable[[], None]]:
         # The sender cache records media during preprocessing, before transport.
         # Keep the next request out until this one has been sent or invalidated.
         lock = self._stage_input_submission_locks.setdefault(stage_id, asyncio.Lock())
         async with lock:
+            processor = self._stage_input_processors.get(stage_id)
+            cache = processor.renderer.mm_processor_cache if processor is not None else None
+            # This guard serializes the stage's only sender. Keep cumulative
+            # writer counts, including cache hits/touches, for earlier readers.
+            previous_refs = cache._shm_cache.writer_flag.copy() if isinstance(cache, ShmObjectStoreSenderCache) else {}
+            submitting = False
+            failed = False
+
+            def mark_submitting() -> None:
+                nonlocal submitting
+                # Transport errors/cancellation can happen after delivery. Once
+                # submission starts, only the receiver may retire these refs.
+                submitting = True
+
+            def rollback() -> None:
+                with self._prompt_processing_lock:
+                    if failed:
+                        self._clear_stage_input_cache(stage_id)
+                    current_processor = self._stage_input_processors.get(stage_id)
+                    current = current_processor.renderer.mm_processor_cache if current_processor is not None else None
+                    if not submitting and isinstance(current, ShmObjectStoreSenderCache):
+                        if cache is not None and current is not cache:
+                            return
+                        storage = current._shm_cache
+                        refs = storage.writer_flag
+                        # Only restore IDs still alive; eviction may have removed
+                        # old objects. Earlier readers retain their ownership.
+                        for object_id in refs:
+                            if object_id in previous_refs:
+                                refs[object_id] = previous_refs[object_id]
+                                continue
+                            # A new unsent allocation has no readers. Mark its
+                            # initial write consumed so it is reclaimable AND a
+                            # retry's sender/receiver pre-touches stay balanced.
+                            # Leaving both counts at zero would make the receiver
+                            # skip its first touch of the now-cached object.
+                            address, _ = storage.key_index[storage.id_index[object_id]]
+                            with storage.ring_buffer.access_buf(address) as (data, _):
+                                data[: storage.flag_bytes] = storage.ring_buffer.int2byte(storage.n_readers)
+                            refs[object_id] = 1
+
             try:
-                yield
+                yield mark_submitting
             except BaseException:
-                # Finish cache rollback even if the caller is cancelled again.
-                cleanup = asyncio.create_task(asyncio.to_thread(self._clear_stage_input_cache, stage_id))
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
-                cleanup.result()
+                failed = True
                 raise
+            finally:
+                if failed or not submitting:
+                    # Finish rollback before releasing the sender to the next
+                    # request, while preserving cancellation during cleanup.
+                    cleanup = asyncio.create_task(asyncio.to_thread(rollback))
+                    cancelled = None
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError as exc:
+                            cancelled = exc
+                    cleanup.result()
+                    if cancelled is not None and not failed:
+                        raise cancelled
 
     def _preselect_stage_mm_cache_replica(self, req_id: str, stage_id: int, prompt: Any) -> int | None:
         """Bind the receiving replica when the prompt's multimodal cache keys must name it: it
@@ -2791,7 +2840,7 @@ class OrchestratorBase:
                 if self._next_stage_input_is_tokens(next_input)
                 else self._stage_input_submission(next_logical)
             )
-            async with input_guard:
+            async with input_guard as mark_submitting:
                 try:
                     scoped_replica_id = (
                         None
@@ -2826,6 +2875,8 @@ class OrchestratorBase:
                         await asyncio.to_thread(self._clear_stage_input_cache, next_logical)
                     return
 
+                if mark_submitting is not None:
+                    mark_submitting()
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
@@ -3269,7 +3320,7 @@ class Orchestrator(OrchestratorBase):
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
         input_guard = self._stage_input_submission(stage_id) if stage_id != 0 else nullcontext()
-        async with input_guard:
+        async with input_guard as mark_submitting:
             expected_replica_id = None
             if stage_id != 0:
                 _t_preprocess = _time.perf_counter()
@@ -3297,6 +3348,8 @@ class Orchestrator(OrchestratorBase):
                     return
                 req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
             req_state.stage_submit_ts[stage_id] = _time.time()
+            if mark_submitting is not None:
+                mark_submitting()
             if not await self._dispatch_or_fail_request(
                 lambda: self.stage_pools[stage_id].submit_initial(
                     request_id,
