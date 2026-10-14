@@ -2128,6 +2128,9 @@ class OrchestratorBase:
     async def _stage_input_submission(self, stage_id: int) -> AsyncIterator[Callable[[], None]]:
         # The sender cache records media during preprocessing, before transport.
         # Keep the next request out until this one has been sent or invalidated.
+        # mark_submitting() starts the uncertain-delivery interval; it does not
+        # confirm send completion. Keep preprocessing and dispatch ordered so a
+        # later cache-only request cannot overtake the request carrying its data.
         lock = self._stage_input_submission_locks.setdefault(stage_id, asyncio.Lock())
         async with lock:
             processor = self._stage_input_processors.get(stage_id)
@@ -2153,6 +2156,8 @@ class OrchestratorBase:
                     if not submitting and isinstance(current, ShmObjectStoreSenderCache):
                         if cache is not None and current is not cache:
                             return
+                        # Private SHM counter/layout contract verified with vLLM
+                        # 0.31.0; keep the real sender/receiver tests on upgrades.
                         storage = current._shm_cache
                         refs = storage.writer_flag
                         # Only restore IDs still alive; eviction may have removed
