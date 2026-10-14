@@ -39,6 +39,7 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.preprocess import OmniRenderer
 from vllm_omni.model_executor.stage_input_processors import (
     joyai_vl_interaction as joyai_bridge,
 )
@@ -55,6 +56,7 @@ from .test_orchestrator import (
     _engine_core_outputs,
     _enqueue_add_request,
     _get_output_message,
+    _processed_request,
     _wait_for,
 )
 
@@ -1110,6 +1112,73 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
     finally:
         for q in queues:
             q.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["fps", "num_frames"])
+async def test_bad_video_sampling_options_keep_orchestrator_alive(orchestrator_factory, option):
+    from vllm.model_executor.models.qwen3_vl import Qwen3VLMultiModalProcessor
+
+    stage0 = FakeStageClient()
+    stage1 = FakeStageClient(final_output=True)
+    output_processor = FakeOutputProcessor(request_outputs=[_build_request_output("valid-video")])
+    fixture = orchestrator_factory([stage0, stage1], output_processors=[FakeOutputProcessor(), output_processor])
+    info = SimpleNamespace(
+        ctx=SimpleNamespace(
+            get_merged_mm_kwargs=lambda kw, **_: kw,
+            get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        ),
+        get_hf_config=lambda: SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            vision_start_token_id=1,
+            vision_end_token_id=2,
+            video_token_id=3,
+        ),
+        get_tokenizer=lambda: None,
+    )
+    processor = SimpleNamespace(
+        info=info,
+        _get_hf_mm_inputs=lambda items, kwargs: ({"videos": [(None, {})]}, kwargs, {}),
+    )
+    renderer = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_vl")),
+        mm_processor_cache=None,
+        get_mm_processor=lambda: processor,
+    )
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        OmniRenderer._validate_video_processor_kwargs(renderer, prompt)
+        if request_id == "bad-video":
+            # Exercise the real upstream list indexing on the unpatched code.
+            Qwen3VLMultiModalProcessor._apply_hf_processor_main(processor, None, prompt["mm_processor_kwargs"])
+        return _processed_request(request_id, params)
+
+    fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs, renderer=renderer)
+    for request_id in ("bad-video", "valid-video"):
+        options: dict[str, list[float]] = {option: []} if request_id == "bad-video" else {}
+        prompt = {"prompt": "describe", "multi_modal_data": {"video": [None]}, "mm_processor_kwargs": options}
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=prompt,
+            original_prompt=prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            entry_stage_id=1,
+        )
+        if request_id == "bad-video":
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and not error.fatal
+            assert option in error.error
+            assert stage1.add_request_calls == []
+        else:
+            await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+            stage1.push_engine_core_outputs(_engine_core_outputs("valid-video", 1.0))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.finished
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+        assert stage0.shutdown_calls == stage1.shutdown_calls == 0
 
 
 @pytest.mark.asyncio

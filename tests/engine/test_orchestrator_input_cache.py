@@ -340,7 +340,8 @@ async def test_shm_submission_uncertainty_keeps_receiver_references(shm_pipeline
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["bypass", "forward"])
-async def test_malformed_video_options_fail_only_the_request(cache_pipeline, monkeypatch, mocker, path):
+@pytest.mark.parametrize("options", [{"size": 123}, {"fps": []}, {"num_frames": []}])
+async def test_malformed_video_options_fail_only_the_request(cache_pipeline, monkeypatch, mocker, path, options):
     p = cache_pipeline
     processor = p.orch._stage_input_processors[1]
     renderer = processor.renderer
@@ -353,7 +354,7 @@ async def test_malformed_video_options_fail_only_the_request(cache_pipeline, mon
     def process_inputs(**kwargs):
         if kwargs["request_id"] == "bad-video":
             OmniRenderer._validate_video_processor_kwargs(
-                renderer, {"multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": {"size": 123}}
+                renderer, {"multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": options}
             )
         return original(**kwargs)
 

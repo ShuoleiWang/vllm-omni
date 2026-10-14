@@ -12,6 +12,7 @@ the concrete class the same way upstream ``renderer_from_config`` does.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, cast
 
 from vllm.exceptions import VLLMValidationError
@@ -69,6 +70,45 @@ class OmniRenderer:
             raise VLLMValidationError(
                 "Video processor size must be a dictionary.", parameter="mm_processor_kwargs", value=size
             )
+        for name in ("fps", "num_frames"):
+            value = kwargs.get(name)
+            if value is None:
+                continue
+            per_video = isinstance(value, list)
+            values = value if per_video else [value]
+            # vLLM indexes per-video lists before entering its HF error wrapper.
+            # Its fps list dispatch specifically requires floats.
+            if name == "fps":
+                types = (float,) if per_video else (int, float)
+                expected = "finite floats" if per_video else "finite numbers"
+            else:
+                types = (int,)
+                expected = "integers"
+            if not values or any(
+                isinstance(item, bool)
+                or not isinstance(item, types)
+                or item <= 0
+                or (isinstance(item, float) and not math.isfinite(item))
+                for item in values
+            ):
+                raise VLLMValidationError(
+                    f"Video processor {name} must contain positive {expected}.",
+                    parameter="mm_processor_kwargs",
+                    value=value,
+                )
+            if per_video:
+                # Use the upstream parser: a frame list or (frames, metadata)
+                # tuple represents one video, not one video per list element.
+                video_items = processor.info.parse_mm_data(
+                    {"video": prompt["multi_modal_data"]["video"]}, validate=False
+                )
+                num_videos = video_items.get_count("video", strict=False)
+                if len(value) < num_videos:
+                    raise VLLMValidationError(
+                        f"Video processor {name} needs at least {num_videos} per-video values, got {len(value)}.",
+                        parameter="mm_processor_kwargs",
+                        value=value,
+                    )
 
     def _process_singleton(self, prompt, *, skip_mm_cache: bool = False, tok_params=None):
         renderer = cast(BaseRenderer, self)
